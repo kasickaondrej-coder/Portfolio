@@ -13,16 +13,18 @@ The menu at the top has these pages:
 
 | Page | What it does |
 |---|---|
-| Transactions | Choose your transactions file (type the path, or use the Finder buttons), or create a new empty one. Shows all rows, sorted by date. **Delete** removes one row after asking; the previous version of the file is kept next to it as `yourfile.csv.bak` |
+| Transactions | Choose your transactions file (type or paste the path; quotes, `file://` and `~` are fine, and a path without a leading `/` starts in your home folder), or create a new empty one. Shows all rows, sorted by date. **Delete** removes one row after asking and touches nothing else in the file. **Undo last change** puts the file back as it was before the last add, savings plan, delete or undo (it asks first) |
 | Add | Add one buy, sell or dividend, with all the columns of section 4 (fee, currency, FX rate are optional) |
-| Savings plan | Writes all the buys of a regular plan (every week on a weekday, or every month on a day) at market closing prices, like the `dca` command in section 8. If buys of that ticker already exist in that period, it warns you before writing anything |
-| Report | Runs the report on your file with every option of section 9: base currency, as-of date, one or more benchmarks (separate them with commas), top movers, offline, already split-adjusted quantities, offline prices file, cache folder. Below the report are links to download it as JSON and the daily values as CSV (for Excel) |
+| Savings plan | Writes all the buys of a regular plan (every week on a weekday, or every month on a day) at market closing prices, like the `dca` command in section 8. If buys of that ticker already exist in that period, it shows a warning page first and writes nothing until you press "Add the plan anyway" (reloading that page is harmless; the button works once). Only trading weekdays (Monday to Friday) can be chosen |
+| Report | Runs the report on your file with every option of section 9: base currency, as-of date, one or more benchmarks (separate them with commas), top movers, offline, already split-adjusted quantities, offline prices file, cache folder. Every field has a short hint; leave the price file and cache folder empty unless you know you need them. A future as-of date shows a note, because prices for days that have not happened do not exist. A short legend explains XIRR, TWR, MWR, drawdown and UP/DOWN. Below the report are links to download it as JSON and the daily values as CSV (for Excel) |
 | Example | Runs the built-in example report. It does not touch your own file and needs no internet |
 
 - The file in use is shown at the top of every page, and the app remembers it next time.
 - After pressing a button, a yellow "Working, please wait" bar appears. Downloading prices from Yahoo can take a minute; do not click again.
 - Errors are shown in a red box saying what to fix. A form with a mistake writes nothing to your file.
 - Reloading the page never adds a transaction twice.
+- Before every change (add, savings plan, delete, undo) a dated copy of your file is saved in a hidden folder called `.portfolio_backups` next to it. The last 20 copies are kept. **Undo last change** on the Transactions page restores the newest one, and saves the current file first, so you can undo the undo. This is also how you take back a savings plan you ran twice by mistake.
+- A path to a folder that does not exist is refused with a message, and file problems (no permission, a file that is not UTF-8 text) are explained in plain words instead of a technical error.
 - From the terminal the same page starts with `python -m portfolio_tracker ui`.
 
 The rest of this guide explains the same features as terminal commands, and what the numbers mean.

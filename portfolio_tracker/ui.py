@@ -4,7 +4,10 @@
     options: --port N (default 8765), --no-browser
 
 Pages are rendered on the server. Every form POSTs and then redirects
-(POST/redirect/GET), so reloading a page never repeats an action. The only
+(POST/redirect/GET), so reloading a page never repeats an action. Before every
+write to the transactions file a timestamped copy is saved in a hidden folder
+next to it (".portfolio_backups"), and the Transactions page can undo the last
+change. The only
 JavaScript is a delete confirm() and a "please wait" banner that also blocks
 double submits. The server listens on 127.0.0.1 only and rejects requests from
 other web sites (Host and Origin checks).
@@ -21,16 +24,18 @@ import json
 import logging
 import os
 import secrets
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import urlopen
 
 import pandas as pd
@@ -56,16 +61,33 @@ EXAMPLE_PRICES = ROOT / "examples" / "prices_synthetic.csv"
 LOCK = threading.RLock()  # serialises file writes and settings
 RESULTS: "OrderedDict[str, dict]" = OrderedDict()  # report results kept in memory
 FLASH: "OrderedDict[str, dict]" = OrderedDict()  # one-shot messages + form values
+PENDING: "OrderedDict[str, dict]" = OrderedDict()  # savings plans waiting for "add anyway" (used once)
 
 # ----------------------------------------------------------------- settings
 
 
+def _clean_form_dict(d) -> dict:
+    """Keep only text values of a saved form (anything else in a damaged settings file is ignored)."""
+    if not isinstance(d, dict):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
+
+
 def load_settings() -> dict:
+    """Read the settings file. Damaged or wrongly typed parts are ignored (defaults are used instead)."""
     try:
         d = json.loads(settings_path().read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
     except Exception:
         return {}
+    if not isinstance(d, dict):
+        return {}
+    out: dict = {}
+    if isinstance(d.get("csv_path"), str) and d["csv_path"].strip():
+        out["csv_path"] = d["csv_path"]
+    for k in ("dca", "report"):
+        if isinstance(d.get(k), dict):
+            out[k] = _clean_form_dict(d[k])
+    return out
 
 
 def save_settings(**updates) -> None:
@@ -82,8 +104,29 @@ def current_path() -> str:
     return load_settings().get("csv_path") or default_csv()
 
 
+_QUOTES = "\"'\u201c\u201d\u2018\u2019`"
+
+
 def expand(p: str) -> str:
-    return str(Path(os.path.expanduser(p.strip())))
+    """Turn what a person typed or pasted into an absolute path.
+
+    Surrounding quotes and a file:// prefix are removed, ~ is expanded and a relative path is taken
+    relative to the user's home folder (never to the folder the server happens to run in).
+    """
+    p = (p or "").strip()
+    while len(p) >= 2 and p[0] in _QUOTES and p[-1] in _QUOTES:
+        p = p[1:-1].strip()
+    if p.lower().startswith("file://"):
+        p = p[7:]
+        if not p.startswith("/"):  # file://localhost/Users/x -> /Users/x
+            p = p[p.find("/"):] if "/" in p else ""
+        p = unquote(p)
+    p = os.path.expanduser(p)
+    if "\x00" in p:
+        raise UserError("the file path contains an invalid character")
+    if not os.path.isabs(p):
+        p = os.path.join(str(Path.home()), p)
+    return str(Path(os.path.normpath(p)))
 
 
 # ------------------------------------------------------------------ helpers
@@ -128,6 +171,18 @@ def check_date(raw: str, name: str, required=True):
 def friendly(e: BaseException) -> str:
     if isinstance(e, (LedgerError, DataError, UserError)):
         return str(e)
+    if isinstance(e, UnicodeDecodeError):
+        return ("The file could not be read as text. Save it as CSV (UTF-8) from your spreadsheet program "
+                "and try again. Nothing was changed.")
+    if isinstance(e, PermissionError):
+        return f"No permission to use {e.filename or 'that file or folder'}. Choose a file in a folder you own. Nothing was changed."
+    if isinstance(e, FileNotFoundError):
+        return f"Could not find {e.filename or 'the file or folder'}. Check the path on the Transactions page. Nothing was changed."
+    if isinstance(e, OSError):
+        what = f" ({e.filename})" if e.filename else ""
+        return f"The file or folder could not be used{what}: {e.strerror or e}. Nothing was changed."
+    if isinstance(e, ValueError):
+        return f"Something in the file or the form is not valid: {e}. Nothing was changed."
     logging.getLogger("portfolio_tracker.ui").error("unexpected error:\n%s", traceback.format_exc())
     return f"Unexpected error ({type(e).__name__}): {e}. Nothing was changed unless stated above."
 
@@ -151,41 +206,154 @@ def store_result(res: dict) -> str:
 # ------------------------------------------------------------- CSV handling
 
 
+def _parse(text: str):
+    """Split CSV text (BOM already removed) into physical lines and records.
+
+    Returns (delimiter, lines, [(first_line, last_line, row)]). Lines keep their own line endings, so
+    joining them gives back exactly the original text. A quoted field may span several lines.
+    """
+    lines = io.StringIO(text, newline="").readlines()
+    try:
+        delim = csv.Sniffer().sniff(text[:4096], delimiters=",;\t").delimiter
+    except csv.Error:
+        delim = ","
+    r = csv.reader(iter(lines), delimiter=delim)
+    recs, prev = [], 0
+    for row in r:
+        recs.append((prev + 1, r.line_num, row))
+        prev = r.line_num
+    return delim, lines, recs
+
+
+def _read_text(path: str) -> str:
+    return Path(path).read_bytes().decode("utf-8").removeprefix("\ufeff")
+
+
 def read_raw(path: str):
-    """Return (delimiter, [(line_num, row_list)]) for the raw CSV file."""
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        sample = f.read(4096)
-        f.seek(0)
-        try:
-            delim = csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter
-        except csv.Error:
-            delim = ","
-        r = csv.reader(f, delimiter=delim)
-        return delim, [(r.line_num, row) for row in r]
+    """Return (delimiter, [(line_num, row_list)]) for the raw CSV file (line_num = last line of the row)."""
+    delim, _, recs = _parse(_read_text(path))
+    return delim, [(end, row) for _, end, row in recs]
 
 
-def sig(row: list) -> str:
-    return hashlib.sha1("\x1f".join(row).encode("utf-8")).hexdigest()[:12]
+def sig(row: list, path: str = "") -> str:
+    """Fingerprint of one row in one file; a page for another file or an edited row no longer matches."""
+    return hashlib.sha1("\x1f".join([str(path)] + list(row)).encode("utf-8")).hexdigest()[:12]
+
+
+# ------------------------------------------------------------------ backups
+
+BACKUP_DIR = ".portfolio_backups"
+BACKUPS_KEPT = 20
+
+
+def backup_dir(path) -> Path:
+    return Path(path).parent / BACKUP_DIR
+
+
+def _backup_key(path, f: Path):
+    m = re.fullmatch(re.escape(Path(path).name) + r"\.(\d{8}-\d{6})(?:-(\d+))?\.csv", f.name)
+    return (m.group(1), int(m.group(2) or 0)) if m else None
+
+
+def list_backups(path) -> list:
+    """Backups of this file, oldest first."""
+    d = backup_dir(path)
+    try:
+        found = [(k, f) for f in d.iterdir() if f.is_file() and (k := _backup_key(path, f))]
+    except OSError:
+        return []
+    return [f for _, f in sorted(found)]
+
+
+def make_backup(path):
+    """Copy the file into the hidden backup folder next to it; None if there is no file yet."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    d = backup_dir(path)
+    d.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    # several writes within one second: number them after the highest one already there, so order is kept
+    used = [k[1] for f in list_backups(path) if (k := _backup_key(path, f))[0] == stamp]
+    dest = d / (f"{path.name}.{stamp}.csv" if not used else f"{path.name}.{stamp}-{max(used) + 1}.csv")
+    shutil.copy2(path, dest)
+    return dest
+
+
+def prune_backups(path) -> None:
+    for old in list_backups(path)[:-BACKUPS_KEPT]:
+        with contextlib.suppress(OSError):
+            old.unlink()
+
+
+@contextlib.contextmanager
+def backed_up(path):
+    """Save a copy before a write. If the write fails without changing the file, the copy is dropped again."""
+    b = make_backup(path)
+    try:
+        yield
+    finally:
+        if b is not None:
+            try:
+                if Path(path).is_file() and Path(path).read_bytes() == b.read_bytes():
+                    b.unlink()
+                else:
+                    prune_backups(path)
+            except OSError:
+                pass
+
+
+def write_bytes_atomic(path: str, data: bytes) -> None:
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        if os.path.exists(path):
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def pretty_stamp(stamp: str) -> str:
+    return f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}"
+
+
+def undo_last_change(path: str, expected: str = "", shown_path: str = "") -> str:
+    """Restore the newest backup (after saving the current state as a backup too)."""
+    if shown_path and shown_path != path:
+        raise LedgerError("a different file is selected now; reload the page and try again")
+    backups = list_backups(path)
+    if not backups:
+        raise UserError("There is no earlier version to go back to yet.")
+    newest = backups[-1]
+    if expected and newest.name != expected:
+        raise LedgerError("the file changed since this page was loaded; reload the page and try again")
+    data = newest.read_bytes()
+    make_backup(path)  # so that "Undo" itself can be undone
+    write_bytes_atomic(path, data)
+    prune_backups(path)
+    return f"restored the version saved at {pretty_stamp(_backup_key(path, newest)[0])} (the state before this was saved too)"
 
 
 def delete_line(path: str, line: int, signature: str) -> str:
-    delim, rows = read_raw(path)
-    if not rows:
+    """Remove exactly the bytes of one row. BOM, line endings and every other byte stay as they were."""
+    data = Path(path).read_bytes()
+    text = data.decode("utf-8")
+    bom = "\ufeff" if text.startswith("\ufeff") else ""
+    delim, lines, recs = _parse(text[len(bom):])
+    if not recs:
         raise LedgerError("file is empty")
-    hit = [i for i, (ln, row) in enumerate(rows) if ln == line and i > 0]
-    if not hit or sig(rows[hit[0]][1]) != signature:
+    hit = [i for i, (_, end, _) in enumerate(recs) if end == line and i > 0]
+    if not hit or sig(recs[hit[0]][2], path) != signature:
         raise LedgerError("the file changed since this page was loaded; reload the page and try again")
-    i = hit[0]
-    removed = rows[i][1]
-    tmp = path + ".tmp"
-    shutil.copy2(path, path + ".bak")  # keep the previous version
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f, delimiter=delim)
-        for j, (_, row) in enumerate(rows):
-            if j != i:
-                w.writerow(row)
-    os.replace(tmp, path)
-    return " | ".join(removed)
+    first, last, row = recs[hit[0]]
+    new_text = bom + "".join(lines[:first - 1] + lines[last:])
+    with backed_up(path):
+        write_bytes_atomic(path, new_text.encode("utf-8"))
+    return " | ".join(row)
 
 
 # --------------------------------------------------------------- page layout
@@ -245,8 +413,9 @@ def field(label, name, value="", size=20, hint="", typ="text"):
             f'<small>{esc(hint)}</small></label>')
 
 
-def checkbox(label, name, checked):
-    return f'<label><input type="checkbox" name="{name}" value="1"{" checked" if checked else ""}> {esc(label)}</label>'
+def checkbox(label, name, checked, hint=""):
+    return (f'<label><input type="checkbox" name="{name}" value="1"{" checked" if checked else ""}> {esc(label)} '
+            f'<small>{esc(hint)}</small></label>')
 
 
 # -------------------------------------------------------------------- pages
@@ -254,7 +423,6 @@ def checkbox(label, name, checked):
 
 def page_transactions(fl, q) -> bytes:
     path = current_path()
-    p = Path(expand(path))
     browse = ""
     if sys.platform == "darwin":
         browse = ('<form method="post" action="/browse"><p>Or pick with Finder: '
@@ -268,14 +436,34 @@ def page_transactions(fl, q) -> bytes:
 </form>
 {browse}
 """
-    if not p.exists():
-        body += ('<div class="warn">This file does not exist yet. Press "Create new empty file here", or just add a '
-                 'transaction (the file is created automatically).</div>')
-    elif p.is_dir():
-        body += '<div class="err">That path is a folder, not a file. Add a file name, e.g. portfolio.csv.</div>'
-    else:
-        body += table_html(p)
+    try:
+        p = Path(expand(path))
+        if not p.exists():
+            body += ('<div class="warn">This file does not exist yet. Press "Create new empty file here", or just add a '
+                     'transaction (the file is created automatically).</div>')
+        elif p.is_dir():
+            body += '<div class="err">That path is a folder, not a file. Add a file name, e.g. portfolio.csv.</div>'
+        else:
+            body += table_html(p)
+        body += undo_html(p)
+    except (OSError, ValueError) as e:
+        body += f'<div class="err">{esc(friendly(e))}</div>'
     return layout("Transactions", body, "/", fl)
+
+
+def undo_html(p: Path) -> str:
+    backups = list_backups(p)
+    if not backups:
+        return ""
+    newest = backups[-1]
+    return (f'<form method="post" action="/undo" onsubmit="return confirm(\'Go back to the version saved at '
+            f'{esc(pretty_stamp(_backup_key(p, newest)[0]))}? The current file is saved first, so you can undo again.\')">'
+            f'<input type="hidden" name="backup" value="{esc(newest.name)}">'
+            f'<input type="hidden" name="path" value="{esc(str(p))}">'
+            f'<p><button>Undo last change</button> <small>Puts the file back as it was before the last add, savings plan, '
+            f'delete or undo (saved {esc(pretty_stamp(_backup_key(p, newest)[0]))}). '
+            f'Older copies are kept in the hidden folder <code>{esc(BACKUP_DIR)}</code> next to the file '
+            f'(the last {BACKUPS_KEPT}).</small></p></form>')
 
 
 def table_html(p: Path) -> str:
@@ -284,7 +472,7 @@ def table_html(p: Path) -> str:
         delim, raw = read_raw(str(p))
     except Exception as e:
         return f'<div class="err">Cannot read the file: {esc(friendly(e))}</div>'
-    sigs = {ln: sig(row) for ln, row in raw[1:]}
+    sigs = {ln: sig(row, str(p)) for ln, row in raw[1:]}
     if not any(any(c.strip() for c in row) for _, row in raw[1:]):
         return "<p>No transactions yet. Add some on the <a href=\"/add\">Add</a> or <a href=\"/dca\">Savings plan</a> page.</p>"
     try:
@@ -292,7 +480,7 @@ def table_html(p: Path) -> str:
     except LedgerError as e:
         out.append(f'<div class="err">The file has a problem: {esc(e)}<br>Fix or delete the bad row below '
                    f'(or edit the file in a spreadsheet program).</div>')
-        out.append("<h2>Raw rows</h2><table><tr><th>line</th>"
+        out.append("<h2>Raw rows</h2><table><tr><th>line in file</th>"
                    + "".join(f"<th>{esc(h)}</th>" for h in (raw[0][1] if raw else [])) + "<th></th></tr>")
         for ln, row in raw[1:]:
             out.append(f"<tr><td>{ln}</td>" + "".join(f"<td class='l'>{esc(c)}</td>" for c in row)
@@ -301,10 +489,10 @@ def table_html(p: Path) -> str:
         return "\n".join(out)
     except Exception as e:
         return f'<div class="err">{esc(friendly(e))}</div>'
-    out.append(f"<p>{len(txs)} transactions (sorted by date). Deleting keeps a copy of the previous file as "
-               f"<code>{esc(p.name)}.bak</code>.</p>")
+    out.append(f"<p>{len(txs)} transactions (sorted by date). Every change keeps a copy of the previous file, "
+               f"so you can use <b>Undo last change</b> below the table.</p>")
     out.append("<table><tr><th>date</th><th class='l'>type</th><th class='l'>ticker</th><th>quantity</th><th>price</th>"
-               "<th>fee</th><th>currency</th><th>amount</th><th>fx_rate</th><th>file line</th><th></th></tr>")
+               "<th>fee</th><th>currency</th><th>amount</th><th>fx_rate</th><th></th></tr>")
 
     def n(x, blank_zero=True):
         return "" if x is None or (blank_zero and x == 0) else f"{x:g}"
@@ -312,7 +500,7 @@ def table_html(p: Path) -> str:
         out.append(
             f"<tr><td>{t.date.date()}</td><td class='l'>{esc(t.type)}</td><td class='l'>{esc(t.ticker)}</td>"
             f"<td>{n(t.quantity)}</td><td>{n(t.price)}</td><td>{n(t.fee)}</td><td>{esc(t.currency or '')}</td>"
-            f"<td>{n(t.amount)}</td><td>{n(t.fx_rate)}</td><td>{t.line}</td>"
+            f"<td>{n(t.amount)}</td><td>{n(t.fx_rate)}</td>"
             f"<td>{del_form(t.line, sigs.get(t.line, ''))}</td></tr>")
     out.append("</table>")
     return "\n".join(out)
@@ -371,33 +559,42 @@ already exist in the date range.</p>
 {field("End date", "end", g("end"), 12, "empty = today")}
 <fieldset><legend>When</legend>
 <label><input type="radio" name="mode" value="weekly"{" checked" if mode != "monthly" else ""}> Every week on
-<select name="weekday">{wdopts}</select></label>
+<select name="weekday">{wdopts}</select>
+<small>only trading weekdays (Monday to Friday) exist; there is no Saturday or Sunday</small></label>
 <label><input type="radio" name="mode" value="monthly"{" checked" if mode == "monthly" else ""}> Every month on day
-<input type="text" name="monthly" value="{esc(g('monthly', '1'))}" size="3"> (1-31)</label>
+<input type="text" name="monthly" value="{esc(g('monthly', '1'))}" size="3"> (1-31)
+<small>if that day is a weekend or holiday, the buy happens on the next trading day</small></label>
 </fieldset>
-{field("Fee per purchase", "fee", g("fee", "0"), 8)}
-{field("Currency", "currency", g("currency"), 8, "empty = ticker's own currency")}
-{field("Decimals for units", "decimals", g("decimals", "4"), 4)}
+{field("Fee per purchase", "fee", g("fee", "0"), 8, "money paid to the broker per buy; 0 if none")}
+{field("Currency", "currency", g("currency"), 8, "leave empty unless you pay in another currency than the ticker's own")}
+{field("Decimals for units", "decimals", g("decimals", "4"), 4, "how many decimals the bought quantity gets (4 is fine)")}
 <fieldset><legend>Prices source (optional)</legend>
-{field("Offline prices CSV", "prices", g("prices"), 50, "empty = download from Yahoo")}
-{field("Cache folder", "cache_dir", g("cache_dir"), 50, "empty = default")}
-{checkbox("Offline: cached prices only", "offline", g("offline") == "1")}
+{field("Offline prices CSV", "prices", g("prices"), 50, "leave empty unless you have your own prices file; empty = download from Yahoo")}
+{field("Cache folder", "cache_dir", g("cache_dir"), 50, "leave empty unless you want downloaded prices stored elsewhere")}
+{checkbox("Offline: cached prices only", "offline", g("offline") == "1", "tick only if you have no internet; works only for prices downloaded before")}
 </fieldset>
 <button>Create savings plan</button>
 </form>"""
     return layout("Savings plan", body, "/dca", fl)
 
 
-def page_dca_warn(dups: list, form: dict) -> bytes:
-    hidden = "".join(f'<input type="hidden" name="{esc(k)}" value="{esc(val)}">' for k, val in form.items())
-    rows = "".join(f"<tr><td>{esc(d)}</td><td>{esc(q)}</td><td>{esc(p)}</td></tr>" for d, q, p in dups[:30])
+def page_dca_warn(fl, q) -> bytes:
+    """GET page for a pending savings plan. Reloading it is harmless: nothing is written or used up."""
+    tok = q.get("t", [""])[0]
+    pend = PENDING.get(tok)
+    if not pend:
+        return layout("Savings plan: possible duplicates",
+                      '<div class="err">This warning is no longer available (it was already used, or the app was '
+                      'restarted). Nothing was written. <a href="/dca">Back to the savings plan form</a></div>', "/dca")
+    dups, form = pend["dups"], pend["form"]
+    rows = "".join(f"<tr><td>{esc(d)}</td><td>{esc(qty)}</td><td>{esc(pr)}</td></tr>" for d, qty, pr in dups[:30])
     more = f"<p>... and {len(dups) - 30} more.</p>" if len(dups) > 30 else ""
     body = f"""
 <div class="warn"><b>Warning:</b> the file already has {len(dups)} buy(s) of {esc(form['ticker'].upper())} in this date
 range (plus 6 days for holiday shifts). Running the plan would probably duplicate them. Nothing has been written.</div>
 <table><tr><th>date</th><th>quantity</th><th>price</th></tr>{rows}</table>{more}
-<form method="post" action="/dca" style="display:inline">{hidden}
-<input type="hidden" name="force" value="1"><button>Add the plan anyway</button></form>
+<form method="post" action="/dca/confirm" style="display:inline">
+<input type="hidden" name="t" value="{esc(tok)}"><button>Add the plan anyway</button></form>
 <a href="/dca">Cancel (go back to the form)</a>"""
     return layout("Savings plan: possible duplicates", body, "/dca")
 
@@ -406,14 +603,14 @@ def report_form(action, v, s):
     g = lambda k, d="": v.get(k, s.get(k, d))  # noqa: E731
     return f"""
 <form method="post" action="{action}">
-{field("Base currency", "base", g("base", "EUR"), 6)}
-{field("As of date", "as_of", g("as_of"), 12, "YYYY-MM-DD, empty = today")}
-{field("Benchmarks", "benchmarks", g("benchmarks"), 40, "symbols separated by comma or space, e.g. VWCE.DE SPY")}
-{field("Biggest movers to show", "top", g("top", "5"), 4)}
-{checkbox("Offline: cached prices only (no internet)", "offline", g("offline") == "1")}
-{checkbox("Quantities already split-adjusted (turn off split adjustment)", "no_split_adjust", g("no_split_adjust") == "1")}
-{field("Offline prices CSV", "prices", g("prices"), 50, "optional; empty = download from Yahoo")}
-{field("Cache folder", "cache_dir", g("cache_dir"), 50, "optional; empty = default ~/.cache/portfolio_tracker")}
+{field("Show results in currency", "base", g("base", "EUR"), 6, "the currency all totals are converted to, e.g. EUR or USD")}
+{field("As of date", "as_of", g("as_of"), 12, "YYYY-MM-DD; leave empty for today (a future date has no prices yet)")}
+{field("Benchmarks", "benchmarks", g("benchmarks"), 40, "optional: funds to compare with, separated by comma or space, e.g. VWCE.DE SPY")}
+{field("How many best and worst holdings to list", "top", g("top", "5"), 4, "a whole number, 5 is a good start")}
+{checkbox("Offline: cached prices only (no internet)", "offline", g("offline") == "1", "tick only if you have no internet; works only for prices downloaded before")}
+{checkbox("Quantities already split-adjusted (turn off split adjustment)", "no_split_adjust", g("no_split_adjust") == "1", "leave unticked unless you already corrected your quantities for stock splits")}
+{field("Offline prices CSV", "prices", g("prices"), 50, "leave empty unless you have your own prices file; empty = download from Yahoo")}
+{field("Cache folder", "cache_dir", g("cache_dir"), 50, "leave empty unless you want downloaded prices stored somewhere else (default: ~/.cache/portfolio_tracker)")}
 <button>Run report</button>
 </form>"""
 
@@ -422,16 +619,29 @@ def result_html(rid: str | None) -> str:
     res = RESULTS.get(rid or "")
     if not res:
         return ""
-    return (f"<h2>Result</h2><p><small>{esc(res['desc'])}</small></p>"
+    notes = "".join(f'<div class="warn">{esc(n)}</div>' for n in res.get("notes", []))
+    return (f"<h2>Result</h2>{notes}<p><small>{esc(res['desc'])}</small></p>"
             f'<p><a href="/download/json?r={quote(rid)}">Download JSON</a> | '
             f'<a href="/download/daily?r={quote(rid)}">Download daily CSV</a></p>'
             f"<pre>{esc(res['text'])}</pre>")
 
 
+LEGEND = """
+<h2>What the words mean</h2>
+<ul>
+<li><b>XIRR</b>: the yearly return on the money you actually put in, taking into account <i>when</i> you added it.</li>
+<li><b>TWR</b> (time-weighted return): how the investments themselves performed, no matter when you added or took out money.</li>
+<li><b>MWR</b> (money-weighted return): the return on your own money, so it depends on when you added or took out money.
+ If it is below the TWR, your timing cost you a little.</li>
+<li><b>Drawdown</b>: the biggest fall from a high point to the lowest point after it; it shows how bad the worst dip was.</li>
+<li><b>UP / DOWN</b>: the holdings that gained the most (UP) and lost the most (DOWN) money.</li>
+</ul>"""
+
+
 def page_report(fl, q) -> bytes:
     v = (fl or {}).get("values", {})
     body = "<p>Uses the file shown above.</p>" + report_form("/report", v, load_settings().get("report", {}))
-    body += result_html(q.get("r", [None])[0])
+    body += result_html(q.get("r", [None])[0]) + LEGEND
     return layout("Report", body, "/report", fl)
 
 
@@ -441,7 +651,7 @@ def page_example(fl, q) -> bytes:
 years, synthetic prices, as of 2026-11-09, benchmark VWCE.DE). It does not touch your own file or settings and needs no
 internet.</p>
 <form method="post" action="/example"><button>Run the example report</button></form>"""
-    body += result_html(q.get("r", [None])[0])
+    body += result_html(q.get("r", [None])[0]) + LEGEND
     return layout("Example", body, "/example", fl)
 
 
@@ -473,9 +683,9 @@ def run_report(tx_path: str, base: str, as_of: str, benchmarks: list, top: int, 
 def do_report(f: dict):
     base = (f.get("base") or "EUR").strip().upper() or "EUR"
     as_of = check_date(f.get("as_of", ""), "As of date", required=False)
-    top = num(f.get("top", ""), "Biggest movers", default=5.0, kind=int)
+    top = num(f.get("top", ""), "How many best and worst holdings to list", default=5.0, kind=int)
     if top < 1:
-        raise UserError("Biggest movers must be at least 1")
+        raise UserError("How many best and worst holdings to list must be at least 1")
     bms = [b.strip() for b in (f.get("benchmarks") or "").replace(",", " ").split() if b.strip()]
     keep = {k: f.get(k, "") for k in ("base", "as_of", "benchmarks", "top", "offline", "no_split_adjust", "prices", "cache_dir")}
     p = Path(expand(current_path()))
@@ -483,6 +693,9 @@ def do_report(f: dict):
         raise UserError(f"transactions file not found: {p}. Choose a file on the Transactions page.")
     provider = make_provider(f.get("prices", ""), f.get("cache_dir", ""), f.get("offline") == "1")
     res = run_report(str(p), base, as_of, bms, top, provider, f.get("no_split_adjust") == "1")
+    if as_of and pd.Timestamp(as_of) > pd.Timestamp.today().normalize():
+        res["notes"] = [f"The as-of date {as_of} is in the future. Prices for days that have not happened do not exist, "
+                        "so the figures use the latest prices known today. This is not a forecast."]
     save_settings(report=keep)
     return store_result(res)
 
@@ -511,8 +724,9 @@ def do_add(f: dict) -> str:
         if not g("quantity") or not g("price"):
             raise UserError(f"a {typ} needs Quantity and Price per unit")
         kw = dict(quantity=g("quantity"), price=g("price"), amount=None)
-    with LOCK:
-        append_transaction(expand(current_path()), date=date, type=typ, ticker=ticker, fee=g("fee"),
+    path = expand(current_path())
+    with LOCK, backed_up(path):
+        append_transaction(path, date=date, type=typ, ticker=ticker, fee=g("fee"),
                            currency=g("currency"), fx_rate=g("fx_rate"), **kw)
     return f"added {typ} {ticker.upper()} on {date}"
 
@@ -553,7 +767,7 @@ def do_dca(f: dict) -> str | list:
                          monthly=monthly, fee=fee, currency=(f.get("currency") or "").strip() or None,
                          decimals=decimals, prices=None, cache_dir=None, offline=False)
     buf = io.StringIO()
-    with LOCK, contextlib.redirect_stdout(buf):
+    with LOCK, backed_up(path), contextlib.redirect_stdout(buf):
         cli.cmd_dca(args, provider=provider)
     save_settings(dca={k: f.get(k, "") for k in ("ticker", "amount", "start", "end", "mode", "weekday", "monthly",
                                                  "fee", "currency", "decimals", "prices", "cache_dir", "offline")})
@@ -567,11 +781,11 @@ def do_setfile(f: dict) -> str:
     p = Path(expand(raw))
     if p.is_dir():
         raise UserError(f"{p} is a folder; add a file name such as portfolio.csv")
+    if not p.parent.is_dir():
+        raise UserError(f"the folder {p.parent} does not exist. Check the path, or create the folder first.")
     if f.get("action") == "create":
         if p.exists() and p.stat().st_size > 0:
             raise UserError(f"{p} already exists and is not empty; it was not changed. Use 'Use this file'.")
-        if not p.parent.is_dir():
-            raise UserError(f"the folder {p.parent} does not exist")
         p.write_text(",".join(CSV_COLUMNS) + "\n", encoding="utf-8")
         save_settings(csv_path=str(p))
         return f"created {p} and selected it"
@@ -600,6 +814,13 @@ def do_browse(mode: str) -> str:
 
 
 # ------------------------------------------------------------------- server
+
+
+class Server(ThreadingHTTPServer):
+    request_queue_size = 64  # a browser may open several connections at once
+
+
+MAX_BODY = 1_000_000
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -639,7 +860,7 @@ class Handler(BaseHTTPRequestHandler):
         fl = FLASH.pop(q.get("f", [""])[0], None)
         try:
             pages = {"/": page_transactions, "/add": page_add, "/dca": page_dca,
-                     "/report": page_report, "/example": page_example}
+                     "/report": page_report, "/example": page_example, "/dca/warn": page_dca_warn}
             if u.path in pages:
                 return self.send(pages[u.path](fl, q))
             if u.path in ("/download/json", "/download/daily"):
@@ -659,11 +880,18 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not self.host_ok() or (origin and urlparse(origin).netloc not in self.allowed()):
             return self.send(b"forbidden", 403, "text/plain")
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n < 0:
+                raise ValueError
+        except ValueError:
+            return self.send(b"bad request: invalid Content-Length", 400, "text/plain")
+        if n > MAX_BODY:
+            return self.send(b"request too large", 413, "text/plain")
         form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True).items()}
         path = urlparse(self.path).path
         back = {"/setfile": "/", "/delete": "/", "/browse": "/", "/add": "/add", "/dca": "/dca",
-                "/report": "/report", "/example": "/example"}.get(path)
+                "/report": "/report", "/example": "/example", "/dca/confirm": "/dca", "/undo": "/"}.get(path)
         if back is None:
             return self.send(b"not found", 404, "text/plain")
         try:
@@ -674,16 +902,35 @@ class Handler(BaseHTTPRequestHandler):
                     tok = flash("ok", do_browse(form.get("mode", "open")))
                 elif path == "/delete":
                     p = expand(current_path())
-                    removed = delete_line(p, int(form.get("line", "0") or 0), form.get("sig", ""))
-                    tok = flash("ok", f"deleted row: {removed}")
+                    try:
+                        line = int(form.get("line", "0") or 0)
+                    except ValueError:
+                        raise UserError("that row number is not valid; reload the page and try again")
+                    removed = delete_line(p, line, form.get("sig", ""))
+                    tok = flash("ok", f"deleted row: {removed}. You can undo this on this page.")
+                elif path == "/undo":
+                    tok = flash("ok", undo_last_change(expand(current_path()), form.get("backup", ""), form.get("path", "")))
                 elif path == "/add":
                     tok = flash("ok", do_add(form))
                 elif path == "/dca":
                     r = do_dca(form)
-                    if isinstance(r, list):  # warn, write nothing
-                        form = {k: v for k, v in form.items() if k != "force"}
-                        return self.send(page_dca_warn(r, form))
+                    if isinstance(r, list):  # warn, write nothing; POST/redirect/GET so a reload does not re-POST
+                        pt = secrets.token_urlsafe(12)
+                        PENDING[pt] = {"dups": r, "path": expand(current_path()),
+                                       "form": {k: v for k, v in form.items() if k != "force"}}
+                        while len(PENDING) > 20:
+                            PENDING.popitem(last=False)
+                        return self.redirect(f"/dca/warn?{urlencode({'t': pt})}")
                     tok = flash("ok", r)
+                elif path == "/dca/confirm":
+                    pend = PENDING.pop(form.get("t", ""), None)  # usable once
+                    if not pend:
+                        raise UserError("this savings plan was already added or the warning expired; nothing was written. "
+                                        "Check the Transactions page, then fill in the form again if needed")
+                    form = dict(pend["form"])
+                    if pend["path"] != expand(current_path()):
+                        raise LedgerError("a different file is selected now; nothing was written")
+                    tok = flash("ok", do_dca({**form, "force": "1"}))
                 elif path == "/report":
                     rid = do_report(form)
                     return self.redirect(f"/report?r={quote(rid)}")
@@ -692,7 +939,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.redirect(f"/example?r={quote(rid)}")
         except Exception as e:
             msg = friendly(e)
-            tok = flash("err", msg, form if path in ("/add", "/dca", "/report") else None)
+            tok = flash("err", msg, form if path in ("/add", "/dca", "/dca/confirm", "/report") else None)
         self.redirect(f"{back}?{urlencode({'f': tok})}")
 
 
@@ -708,10 +955,10 @@ def already_running(port: int) -> bool:
 def make_server(port: int) -> ThreadingHTTPServer:
     """Bind to 127.0.0.1:port, or to a free port if that one is taken. port=0 always picks a free port."""
     try:
-        return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        return Server(("127.0.0.1", port), Handler)
     except OSError:
         print(f"Port {port} is busy, picking a free one.")
-        return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        return Server(("127.0.0.1", 0), Handler)
 
 
 def serve(port: int = 8765, open_browser: bool = True) -> int:
