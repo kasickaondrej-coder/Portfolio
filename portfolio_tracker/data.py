@@ -338,4 +338,4 @@ def fx_series(provider: Provider, ccy: str, base: str, start: pd.Timestamp, end:
         else:
             cal = a.index.union(b.index)
             return (a.reindex(cal).ffill() * b.reindex(cal).ffill()).dropna()
-    raise DataError(f"no exchange rate {ccy}->{base} available (needs internet, or add it to the prices file)")
+    raise DataError(f"no exchange rate {ccy}->{base}: this needs an internet connection to Yahoo Finance (try again later), or add the rate to the prices file")

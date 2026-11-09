@@ -177,12 +177,14 @@ class Portfolio:
         self.txs = sorted(transactions, key=lambda t: (t.date, {"buy": 0, "sell": 1, "dividend": 2}[t.type], t.line))
         self.provider = provider
         self.base = base.upper()
-        self.as_of = pd.Timestamp(as_of or pd.Timestamp.today()).normalize()
+        today = pd.Timestamp.today().normalize()
+        self.as_of = pd.Timestamp(as_of or today).normalize()
         self.benchmarks = [b.upper() for b in (benchmarks or [])]
         self.split_adjust = split_adjust
         self.warnings: list[str] = []
-        if self.as_of > pd.Timestamp.today().normalize():
-            self.warnings.append(f"valuation date {self.as_of.date()} is in the future: prices after today are not known")
+        if self.as_of > today:
+            self.warnings.append(f"as-of date is in the future, valued as of {today.date()}")
+            self.as_of = today
         future = [t for t in self.txs if t.date > self.as_of]
         if future:
             self.warnings.append(f"{len(future)} transaction(s) after {self.as_of.date()} ignored")
@@ -517,7 +519,7 @@ class Portfolio:
             try:
                 bms.append(self.benchmark(b))
             except DataError as e:
-                self.warnings.append(str(e))
+                self.warnings.append(f"benchmark {b} skipped: {e}")
         for p in periods:
             for b, idx in getattr(self, "_bm_index", {}).items():
                 p.benchmark_twr[b] = twr_between(idx, p.start, p.end)

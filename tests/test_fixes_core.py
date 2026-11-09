@@ -168,7 +168,7 @@ class TestDataErrors:
 
     def test_offline_fx_falls_through_to_missing_rate_message(self, tmp_path):
         yp = YahooProvider(cache_dir=tmp_path, offline=True)
-        with pytest.raises(DataError, match=r"no exchange rate USD->EUR available \(needs internet, or add it to the prices file\)"):
+        with pytest.raises(DataError, match=r"no exchange rate USD->EUR: this needs an internet connection to Yahoo Finance \(try again later\), or add the rate to the prices file"):
             fx_series(yp, "USD", "EUR", pd.Timestamp("2025-01-01"), pd.Timestamp("2025-02-01"))
 
 
@@ -192,3 +192,68 @@ class TestReport:
     def test_future_as_of_warns(self):
         pf = self._pf("2999-01-01")
         assert any("in the future" in w for w in pf.warnings)
+
+
+# ------------------------------------------------- round 2 regressions
+class TestRound2Core:
+    @pytest.mark.parametrize("raw", ["1,5,5", "1,23,456", "12,34,5.6", "1.2.3", "1,234.5,6"])
+    def test_num_rejects_bad_grouping(self, raw):
+        with pytest.raises(LedgerError):
+            parse_rows([_row(quantity=raw)])
+
+    @pytest.mark.parametrize("raw,val", [("1,234,567", 1234567), ("1,234,567.5", 1234567.5),
+                                         ("1.234.567,8", 1234567.8), ("1.234.567", 1234567), ("1,5", 1.5)])
+    def test_num_accepts_proper_grouping(self, raw, val):
+        assert parse_rows([_row(quantity=raw)])[0].quantity == pytest.approx(val)
+
+    def test_ticker_normalised_and_validated(self):
+        assert parse_rows([_row(ticker="vwce.de")])[0].ticker == "VWCE.DE"
+        assert parse_rows([_row(ticker="^gspc")])[0].ticker == "^GSPC"
+        for bad in ("A B", "A$", "X" * 21, "A/B"):
+            with pytest.raises(LedgerError, match="ticker"):
+                parse_rows([_row(ticker=bad)])
+
+    def test_append_normalises_date(self, tmp_path):
+        f = tmp_path / "t.csv"
+        f.write_text(HEADER + "\n")
+        append_transaction(f, date="03.07.2024", type="buy", ticker="aaa", quantity="1", price="2")
+        assert "2024-07-03,buy,AAA" in f.read_text()
+
+    def test_append_refuses_unreadable_or_unbalanced_file(self, tmp_path):
+        f = tmp_path / "t.csv"
+        f.write_bytes(HEADER.encode() + b"\n2024-01-02,buy,X,1,1,,,,\n\xff\xfe\n")
+        with pytest.raises(LedgerError, match="UTF-8"):
+            append_transaction(f, date="2024-02-01", type="buy", ticker="X", quantity="1", price="2")
+        f.write_text(HEADER + '\n2024-01-02,buy,X,1,1,,"unclosed,,\n')
+        before = f.read_bytes()
+        with pytest.raises(LedgerError):
+            append_transaction(f, date="2024-02-01", type="buy", ticker="X", quantity="1", price="2")
+        assert f.read_bytes() == before
+
+    def test_append_refuses_quote_swallowing_new_row(self, tmp_path):
+        f = tmp_path / "t.csv"
+        f.write_text(HEADER + '\n2024-01-02,buy,X,1,1,,,,\n2024-01-03,buy,Y,1,1,,,"note\n')
+        before = f.read_bytes()
+        with pytest.raises(LedgerError):
+            append_transaction(f, date="2024-02-01", type="buy", ticker="X", quantity="1", price="2")
+        assert f.read_bytes() == before
+
+    def test_future_as_of_is_clamped_and_explained(self):
+        today = pd.Timestamp.today().normalize()
+        far = today + pd.Timedelta(days=400)
+        idx = pd.date_range(today - pd.Timedelta(days=60), today, freq="D")
+        p = StaticProvider({"AAA": pd.Series(10.0, index=idx)}, {"AAA": "EUR"})
+        txs = parse_rows([_row(date=(today - pd.Timedelta(days=30)).strftime("%Y-%m-%d"), ticker="AAA")])
+        r = Portfolio(txs, p, as_of=far).report()
+        assert r.as_of == today
+        assert f"as-of date is in the future, valued as of {today.date()}" in r.warnings
+        assert " now: " in render_text(r)
+        r2 = Portfolio(txs, p, as_of=today - pd.Timedelta(days=5)).report()
+        assert f"on {r2.as_of.date()}:" in render_text(r2)
+
+    def test_unknown_benchmark_gives_warning(self):
+        p = _provider()
+        txs = parse_rows([_row(date="2025-01-02", ticker="AAA", currency="EUR")])
+        r = Portfolio(txs, p, as_of="2025-06-01", benchmarks=["ZZZZ"]).report()
+        assert any("benchmark ZZZZ skipped" in w for w in r.warnings)
+        assert "benchmark ZZZZ skipped" in render_text(r)

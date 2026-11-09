@@ -71,13 +71,24 @@ def _num(raw: Optional[str], name: str, line: int, default: Optional[float] = 0.
     if raw is None or str(raw).strip() == "":
         return default
     txt = str(raw).strip().replace("\u00a0", "").replace(" ", "").replace("'", "")
+    bad = LedgerError(f"{_at(line)}{name}={raw!r} is not a valid number (check the thousands and decimal separators)")
     if "," in txt and "." in txt:
-        if txt.rfind(",") > txt.rfind("."):
+        if txt.rfind(",") > txt.rfind("."):  # 1.234.567,8
+            if not re.fullmatch(r"-?\d{1,3}(\.\d{3})+,\d+", txt):
+                raise bad
             txt = txt.replace(".", "").replace(",", ".")
-        else:
+        else:  # 1,234,567.8
+            if not re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?", txt):
+                raise bad
             txt = txt.replace(",", "")
     elif txt.count(",") > 1:
+        if not re.fullmatch(r"-?\d{1,3}(,\d{3})+", txt):
+            raise bad
         txt = txt.replace(",", "")
+    elif txt.count(".") > 1:
+        if not re.fullmatch(r"-?\d{1,3}(\.\d{3})+", txt):
+            raise bad
+        txt = txt.replace(".", "")
     elif "," in txt:
         if _AMBIGUOUS.match(txt):
             raise LedgerError(
@@ -119,6 +130,20 @@ def _date(raw: Optional[str], line: int) -> pd.Timestamp:
     return d
 
 
+_TICKER = re.compile(r"[A-Z0-9.\-=^&]{1,20}")
+
+
+def clean_ticker(raw: Optional[str], line: int = 0) -> str:
+    """Upper-case ticker; only letters, digits and . - = ^ & (at most 20 characters) are accepted."""
+    t = (raw or "").strip().upper()
+    if not t:
+        raise LedgerError(f"{_at(line)}missing ticker")
+    if not _TICKER.fullmatch(t):
+        raise LedgerError(f"{_at(line)}ticker {raw!r} is not valid: use 1 to 20 letters, digits or . - = ^ & "
+                          "(no spaces), e.g. VWCE.DE")
+    return t
+
+
 def parse_rows(rows: list[dict], start_line: int = 2, lines: Optional[list[int]] = None) -> list[Transaction]:
     txs: list[Transaction] = []
     for i, row in enumerate(rows):
@@ -130,9 +155,7 @@ def parse_rows(rows: list[dict], start_line: int = 2, lines: Optional[list[int]]
         t = (row.get("type") or "").lower()
         if t not in VALID_TYPES:
             raise LedgerError(f"{_at(line)}type must be one of {sorted(VALID_TYPES)}, got {t!r}")
-        ticker = (row.get("ticker") or "").strip().upper()
-        if not ticker:
-            raise LedgerError(f"{_at(line)}missing ticker")
+        ticker = clean_ticker(row.get("ticker"), line)
         raw_ccy = (row.get("currency") or "").strip()
         if raw_ccy and not re.fullmatch(r"[A-Za-z]{3}", raw_ccy):
             raise LedgerError(f"{_at(line)}currency {raw_ccy!r} must be a 3-letter code such as EUR, USD or GBP")
@@ -178,26 +201,36 @@ def parse_rows(rows: list[dict], start_line: int = 2, lines: Optional[list[int]]
     return txs
 
 
-def load_transactions(path: str | Path) -> list[Transaction]:
+def parse_text(text: str, allow_empty: bool = False) -> list[Transaction]:
+    """Parse CSV text (BOM already removed)."""
+    f = io.StringIO(text, newline="")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.DictReader(f, dialect=dialect)
+    rows, lines = [], []
+    for row in reader:
+        rows.append(row)
+        lines.append(reader.line_num)
+    txs = parse_rows(rows, lines=lines)
+    if not txs and not allow_empty:
+        raise LedgerError("no transactions in the file")
+    return txs
+
+
+def load_transactions(path: str | Path, allow_empty: bool = False) -> list[Transaction]:
     path = Path(path)
     if not path.exists():
         raise LedgerError(f"transactions file not found: {path}")
     with path.open(newline="", encoding="utf-8-sig") as f:
-        sample = f.read(4096)
-        f.seek(0)
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        reader = csv.DictReader(f, dialect=dialect)
-        rows, lines = [], []
-        for row in reader:
-            rows.append(row)
-            lines.append(reader.line_num)
-    txs = parse_rows(rows, lines=lines)
-    if not txs:
-        raise LedgerError(f"no transactions in {path}")
-    return txs
+        text = f.read()
+    try:
+        return parse_text(text, allow_empty)
+    except LedgerError as e:
+        if str(e) == "no transactions in the file":
+            raise LedgerError(f"no transactions in {path}") from None
+        raise
 
 
 _NUMERIC = ("quantity", "price", "fee", "amount", "fx_rate")
@@ -240,19 +273,38 @@ def _file_style(path: Path) -> dict:
             "needs_newline": bool(raw) and raw[-1:] not in (b"\n", b"\r")}
 
 
+def _decode_existing(path: Path) -> str:
+    try:
+        return path.read_bytes().decode("utf-8").removeprefix("\ufeff")
+    except UnicodeDecodeError:
+        raise LedgerError(f"{path} cannot be read as UTF-8 text; save it as CSV (UTF-8) first. Nothing was written.") from None
+
+
 def append_transactions(path: str | Path, rows_in: list[dict]) -> None:
-    """Validate every row, then append them all in a single write (all or nothing)."""
+    """Validate every row, then append them all in a single write (all or nothing).
+
+    An existing file must be readable (UTF-8, valid rows) and must still parse, with exactly the new rows
+    added, after appending; otherwise nothing is written.
+    """
     path = Path(path)
+    parsed = []
     for fields in rows_in:
         row = {c: "" if fields.get(c) is None else str(fields.get(c)) for c in CSV_COLUMNS}
         try:
-            parse_rows([row], lines=[0])  # raises on invalid input
+            tx = parse_rows([row], lines=[0])[0]  # raises on invalid input
         except LedgerError as e:
             raise LedgerError(re.sub(r"^line \d+: ", "", str(e))) from None
+        parsed.append(tx)
     new = not path.exists() or path.stat().st_size == 0
+    existing_text = ""
     if new:
         style = {"delimiter": ",", "decimal_comma": False, "eol": "\r\n", "cols": list(CSV_COLUMNS), "needs_newline": False}
     else:
+        existing_text = _decode_existing(path)
+        try:
+            before = len(parse_text(existing_text, allow_empty=True))
+        except LedgerError as e:
+            raise LedgerError(f"{path} has a problem, so nothing was added: {e}") from None
         style = _file_style(path)
     cols = style["cols"]
     for fields in rows_in:
@@ -266,8 +318,17 @@ def append_transactions(path: str | Path, rows_in: list[dict]) -> None:
                        lineterminator=style["eol"])
     if new:
         w.writeheader()
-    for fields in rows_in:
+    for fields, tx in zip(rows_in, parsed):
+        fields = {**fields, "date": tx.date.strftime("%Y-%m-%d"), "ticker": tx.ticker}  # always YYYY-MM-DD
         w.writerow({c: _fmt_value(fields.get(c), c, style["decimal_comma"]) for c in cols})
+    if not new:
+        try:
+            after = len(parse_text(existing_text + buf.getvalue(), allow_empty=True))
+        except LedgerError:
+            after = -1
+        if after != before + len(rows_in):
+            raise LedgerError(f"{path} is not in a shape new rows can be added to safely (for example an unclosed "
+                              "quote); nothing was added. Fix the file first.")
     with path.open("ab") as f:  # appending keeps an existing BOM untouched
         f.write(buf.getvalue().encode("utf-8"))
 

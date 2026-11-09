@@ -25,6 +25,7 @@ import logging
 import os
 import secrets
 import re
+import tempfile
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,8 @@ from . import cli
 from .analytics import Portfolio
 from .data import DataError, StaticProvider, YahooProvider
 from .report import render_json, render_text
-from .transactions import CSV_COLUMNS, LedgerError, append_transaction, load_transactions
+from .transactions import (CSV_COLUMNS, LedgerError, _date, _num, append_transaction, clean_ticker,
+                           load_transactions, parse_rows)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,7 +72,18 @@ def _clean_form_dict(d) -> dict:
     """Keep only text values of a saved form (anything else in a damaged settings file is ignored)."""
     if not isinstance(d, dict):
         return {}
-    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
+    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str) and _safe_text(v)}
+
+
+def _safe_text(v: str) -> bool:
+    """False for text with NUL or characters that cannot be written as UTF-8 (lone surrogates)."""
+    if "\x00" in v:
+        return False
+    try:
+        v.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def load_settings() -> dict:
@@ -82,7 +95,7 @@ def load_settings() -> dict:
     if not isinstance(d, dict):
         return {}
     out: dict = {}
-    if isinstance(d.get("csv_path"), str) and d["csv_path"].strip():
+    if isinstance(d.get("csv_path"), str) and d["csv_path"].strip() and _safe_text(d["csv_path"]):
         out["csv_path"] = d["csv_path"]
     for k in ("dca", "report"):
         if isinstance(d.get(k), dict):
@@ -146,11 +159,15 @@ def num(raw: str, name: str, default=None, kind=float):
         if default is None:
             raise UserError(f"{name} is required")
         return kind(default)
+    if kind is float:
+        try:
+            return _num(raw, name, 0)
+        except LedgerError as e:
+            raise UserError(str(e)) from None
     try:
-        v = float(raw.replace(",", ".")) if kind is float else int(raw)
+        return int(raw)
     except ValueError:
-        raise UserError(f"{name}: {raw!r} is not a valid {'number' if kind is float else 'whole number'}")
-    return v
+        raise UserError(f"{name}: {raw!r} is not a valid whole number")
 
 
 def check_date(raw: str, name: str, required=True):
@@ -304,17 +321,42 @@ def backed_up(path):
 
 
 def write_bytes_atomic(path: str, data: bytes) -> None:
-    tmp = path + ".tmp"
+    """Replace the file's content atomically. A symlink stays a link (its target is updated); the temp file is
+    unique and lives next to the real file."""
+    real = os.path.realpath(path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real) or ".", prefix=os.path.basename(real) + ".", suffix=".tmp")
     try:
-        with open(tmp, "wb") as f:
+        with os.fdopen(fd, "wb") as f:
             f.write(data)
-        if os.path.exists(path):
-            shutil.copymode(path, tmp)
-        os.replace(tmp, path)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(real):
+            shutil.copymode(real, tmp)
+        os.replace(tmp, real)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+LAST_WRITE: dict = {}  # file path -> sha1 of the content after the app's last write (in memory only)
+
+
+def _file_hash(path) -> str:
+    try:
+        return hashlib.sha1(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def note_write(path) -> None:
+    LAST_WRITE[os.path.realpath(path)] = _file_hash(path)
+
+
+def modified_outside(path) -> bool:
+    """True if the file differs from what the app wrote last (only known after a write in this run)."""
+    h = LAST_WRITE.get(os.path.realpath(path))
+    return h is not None and h != _file_hash(path)
 
 
 def pretty_stamp(stamp: str) -> str:
@@ -322,7 +364,8 @@ def pretty_stamp(stamp: str) -> str:
 
 
 def undo_last_change(path: str, expected: str = "", shown_path: str = "") -> str:
-    """Restore the newest backup (after saving the current state as a backup too)."""
+    """Restore the newest backup, then move that backup to .portfolio_backups/undone/ so repeated undo goes
+    back further. The replaced file is kept in undone/ too, so nothing is lost."""
     if shown_path and shown_path != path:
         raise LedgerError("a different file is selected now; reload the page and try again")
     backups = list_backups(path)
@@ -332,10 +375,17 @@ def undo_last_change(path: str, expected: str = "", shown_path: str = "") -> str
     if expected and newest.name != expected:
         raise LedgerError("the file changed since this page was loaded; reload the page and try again")
     data = newest.read_bytes()
-    make_backup(path)  # so that "Undo" itself can be undone
+    undone = backup_dir(path) / "undone"
+    undone.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if Path(path).is_file():
+        shutil.copy2(path, undone / f"{Path(path).name}.replaced-{stamp}-{secrets.token_hex(3)}.csv")
     write_bytes_atomic(path, data)
-    prune_backups(path)
-    return f"restored the version saved at {pretty_stamp(_backup_key(path, newest)[0])} (the state before this was saved too)"
+    shutil.move(str(newest), str(undone / f"{newest.name}.{secrets.token_hex(3)}"))
+    note_write(path)
+    left = len(list_backups(path))
+    return (f"restored the version saved at {pretty_stamp(_backup_key(path, newest)[0])}; "
+            f"{left} more undo step(s) available. The replaced version is kept in {BACKUP_DIR}/undone")
 
 
 def delete_line(path: str, line: int, signature: str) -> str:
@@ -353,6 +403,7 @@ def delete_line(path: str, line: int, signature: str) -> str:
     new_text = bom + "".join(lines[:first - 1] + lines[last:])
     with backed_up(path):
         write_bytes_atomic(path, new_text.encode("utf-8"))
+    note_write(path)
     return " | ".join(row)
 
 
@@ -439,8 +490,8 @@ def page_transactions(fl, q) -> bytes:
     try:
         p = Path(expand(path))
         if not p.exists():
-            body += ('<div class="warn">This file does not exist yet. Press "Create new empty file here", or just add a '
-                     'transaction (the file is created automatically).</div>')
+            body += ('<div class="warn">This file does not exist yet. Press "Create new empty file here" first; '
+                     'Add and Savings plan need an existing file.</div>')
         elif p.is_dir():
             body += '<div class="err">That path is a folder, not a file. Add a file name, e.g. portfolio.csv.</div>'
         else:
@@ -456,14 +507,21 @@ def undo_html(p: Path) -> str:
     if not backups:
         return ""
     newest = backups[-1]
+    stamp = esc(pretty_stamp(_backup_key(p, newest)[0]))
+    warn = ""
+    if modified_outside(p):
+        warn = (" WARNING: the file was changed outside this app after its last write; those changes "
+                "will be replaced (the current file is kept in the undone folder).")
+    n = len(backups)
     return (f'<form method="post" action="/undo" onsubmit="return confirm(\'Go back to the version saved at '
-            f'{esc(pretty_stamp(_backup_key(p, newest)[0]))}? The current file is saved first, so you can undo again.\')">'
+            f'{stamp}?{esc(warn)} The current file is kept, and you can undo again to go back further.\')">'
             f'<input type="hidden" name="backup" value="{esc(newest.name)}">'
             f'<input type="hidden" name="path" value="{esc(str(p))}">'
-            f'<p><button>Undo last change</button> <small>Puts the file back as it was before the last add, savings plan, '
-            f'delete or undo (saved {esc(pretty_stamp(_backup_key(p, newest)[0]))}). '
-            f'Older copies are kept in the hidden folder <code>{esc(BACKUP_DIR)}</code> next to the file '
-            f'(the last {BACKUPS_KEPT}).</small></p></form>')
+            f'<p><button>Undo last change</button> <small>{n} undo step(s) available. Puts the file back as it was '
+            f'before the last add, savings plan or delete (saved {stamp}); each further click goes back one more step. '
+            f'Copies are kept in the hidden folder <code>{esc(BACKUP_DIR)}</code> next to the file '
+            f'(the last {BACKUPS_KEPT}).</small></p>'
+            + (f'<div class="warn">{esc(warn.strip())}</div>' if warn else "") + '</form>')
 
 
 def table_html(p: Path) -> str:
@@ -536,6 +594,7 @@ def page_add(fl, q) -> bytes:
 {field("Currency", "currency", g("currency"), 8, "empty = the ticker's own currency; GBX for pence")}
 {field("FX rate", "fx_rate", g("fx_rate"), 10, "base currency per 1 unit of currency, as charged by broker")}
 </fieldset>
+{checkbox("save anyway", "force_hold", False, "only for a sell above the quantity held (e.g. after a stock split)")}
 <button>Add transaction</button>
 </form>"""
     return layout("Add transaction", body, "/add", fl)
@@ -677,6 +736,7 @@ def run_report(tx_path: str, base: str, as_of: str, benchmarks: list, top: int, 
         "json": render_json(rep),
         "daily": rep.daily.to_csv(index_label="date"),
         "desc": f"{tx_path}, base {base}, as of {as_of or 'today'}",
+        "notes": list(rep.warnings),
     }
 
 
@@ -693,9 +753,6 @@ def do_report(f: dict):
         raise UserError(f"transactions file not found: {p}. Choose a file on the Transactions page.")
     provider = make_provider(f.get("prices", ""), f.get("cache_dir", ""), f.get("offline") == "1")
     res = run_report(str(p), base, as_of, bms, top, provider, f.get("no_split_adjust") == "1")
-    if as_of and pd.Timestamp(as_of) > pd.Timestamp.today().normalize():
-        res["notes"] = [f"The as-of date {as_of} is in the future. Prices for days that have not happened do not exist, "
-                        "so the figures use the latest prices known today. This is not a forecast."]
     save_settings(report=keep)
     return store_result(res)
 
@@ -707,15 +764,34 @@ def do_example():
     return store_result(res)
 
 
+def require_file(path: str) -> None:
+    if not os.path.isfile(path):
+        raise UserError(f"file not found: {path}. Choose it again or create a new one on the Transactions page.")
+
+
+def held_on(path: str, ticker: str, date: pd.Timestamp) -> float:
+    """Quantity of ticker held at the end of `date` according to the file (quantities as entered)."""
+    if os.path.getsize(path) == 0:
+        return 0.0
+    q = 0.0
+    for t in load_transactions(path, allow_empty=True):
+        if t.ticker == ticker and t.date <= date:
+            q += t.quantity if t.type == "buy" else -t.quantity if t.type == "sell" else 0.0
+    return q
+
+
 def do_add(f: dict) -> str:
     typ = f.get("type", "")
     if typ not in ("buy", "sell", "dividend"):
         raise UserError("choose a type")
     date = (f.get("date") or "").strip() or pd.Timestamp.today().strftime("%Y-%m-%d")
-    ticker = (f.get("ticker") or "").strip()
-    if not ticker:
-        raise UserError("ticker is required")
     g = lambda k: (f.get(k) or "").strip() or None  # noqa: E731
+    try:
+        ticker = clean_ticker(f.get("ticker"))
+        day = _date(date, 0)
+    except LedgerError as e:
+        raise UserError(str(e)) from None
+    date = day.strftime("%Y-%m-%d")
     if typ == "dividend":
         if not g("amount"):
             raise UserError("a dividend needs the Amount received")
@@ -725,17 +801,33 @@ def do_add(f: dict) -> str:
             raise UserError(f"a {typ} needs Quantity and Price per unit")
         kw = dict(quantity=g("quantity"), price=g("price"), amount=None)
     path = expand(current_path())
-    with LOCK, backed_up(path):
-        append_transaction(path, date=date, type=typ, ticker=ticker, fee=g("fee"),
-                           currency=g("currency"), fx_rate=g("fx_rate"), **kw)
-    return f"added {typ} {ticker.upper()} on {date}"
+    with LOCK:
+        require_file(path)
+        row = dict(date=date, type=typ, ticker=ticker, fee=g("fee"), currency=g("currency"), fx_rate=g("fx_rate"), **kw)
+        if typ == "sell" and f.get("force_hold") != "1":
+            try:
+                tx = parse_rows([{c: "" if row.get(c) is None else str(row.get(c)) for c in CSV_COLUMNS}], lines=[0])[0]
+            except LedgerError as e:
+                raise UserError(re.sub(r"^line \d+: ", "", str(e))) from None
+            held = held_on(path, ticker, day)
+            if tx.quantity > held + 1e-9:
+                raise UserError(f"you would sell {tx.quantity:g} but only hold {max(held, 0):g} on that date. "
+                                "If a stock split happened, tick 'save anyway'")
+        with backed_up(path):
+            append_transaction(path, **row)
+        note_write(path)
+    msg = f"added {typ} {ticker} on {date}"
+    if day > pd.Timestamp.today().normalize():
+        msg += f". Note: {date} is in the future, so it is ignored in reports until then"
+    return msg
 
 
 def do_dca(f: dict) -> str | list:
     """Returns a message on success, or a list of duplicate rows (needs confirmation)."""
-    ticker = (f.get("ticker") or "").strip().upper()
-    if not ticker:
-        raise UserError("ticker is required")
+    try:
+        ticker = clean_ticker(f.get("ticker"))
+    except LedgerError as e:
+        raise UserError(str(e)) from None
     amount = num(f.get("amount", ""), "Amount")
     start = check_date(f.get("start", ""), "Start date")
     end = check_date(f.get("end", ""), "End date", required=False)
@@ -751,6 +843,7 @@ def do_dca(f: dict) -> str | list:
     if end and pd.Timestamp(end) < pd.Timestamp(start):
         raise UserError("End date is before the start date")
     path = expand(current_path())
+    require_file(path)
     if f.get("force") != "1" and Path(path).is_file():
         lo = pd.Timestamp(start)
         hi = (pd.Timestamp(end) if end else pd.Timestamp.today().normalize()) + pd.Timedelta(days=6)
@@ -769,6 +862,7 @@ def do_dca(f: dict) -> str | list:
     buf = io.StringIO()
     with LOCK, backed_up(path), contextlib.redirect_stdout(buf):
         cli.cmd_dca(args, provider=provider)
+    note_write(path)
     save_settings(dca={k: f.get(k, "") for k in ("ticker", "amount", "start", "end", "mode", "weekday", "monthly",
                                                  "fee", "currency", "decimals", "prices", "cache_dir", "offline")})
     return buf.getvalue().strip() or "plan created"
@@ -916,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
                     r = do_dca(form)
                     if isinstance(r, list):  # warn, write nothing; POST/redirect/GET so a reload does not re-POST
                         pt = secrets.token_urlsafe(12)
-                        PENDING[pt] = {"dups": r, "path": expand(current_path()),
+                        PENDING[pt] = {"dups": r, "path": expand(current_path()), "hash": _file_hash(expand(current_path())),
                                        "form": {k: v for k, v in form.items() if k != "force"}}
                         while len(PENDING) > 20:
                             PENDING.popitem(last=False)
@@ -930,6 +1024,8 @@ class Handler(BaseHTTPRequestHandler):
                     form = dict(pend["form"])
                     if pend["path"] != expand(current_path()):
                         raise LedgerError("a different file is selected now; nothing was written")
+                    if pend.get("hash") != _file_hash(pend["path"]):
+                        raise LedgerError("the file changed, run the plan again. Nothing was written")
                     tok = flash("ok", do_dca({**form, "force": "1"}))
                 elif path == "/report":
                     rid = do_report(form)

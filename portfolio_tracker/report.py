@@ -40,7 +40,8 @@ def plain_words(r: Report) -> list[str]:
     """Three to five short sentences summarising the report for non-experts."""
     b = r.base
     word = "gain" if r.total_pl >= 0 else "loss"
-    first = (f"You put in {money(r.total_bought, b)} and it is worth {money(r.value, b)} now: "
+    when = "now" if r.as_of == pd.Timestamp.today().normalize() else f"on {r.as_of.date()}"
+    first = (f"You put in {money(r.total_bought, b)} and it is worth {money(r.value, b)} {when}: "
              f"a {word} of {money(abs(r.total_pl), b)} ({pct(r.simple_return)})")
     if r.total_sold or r.dividends:
         first += ", counting sales and dividends"

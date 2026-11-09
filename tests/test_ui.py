@@ -213,7 +213,8 @@ def test_backups_and_undo(server, tmp_path):
     assert "changed since" in body and f.read_bytes() == deleted_state
     _, body, _ = post(server + "/undo", undo)
     assert "restored" in body and f.read_bytes() == states[2]
-    assert backups_of(f)[-1].read_bytes() == deleted_state  # the undo itself can be undone
+    assert len(backups_of(f)) == 2  # the used backup moved to undone/, so the next undo goes back further
+    assert deleted_state in [x.read_bytes() for x in (tmp_path / ".portfolio_backups" / "undone").iterdir()]
     # savings plan: undo removes an accidental duplicate plan
     form = {"ticker": "VWCE.DE", "amount": "100", "start": "2025-01-01", "end": "2025-03-30", "mode": "monthly",
             "monthly": "15", "prices": EXAMPLE_PRICES}
@@ -394,3 +395,133 @@ def test_cli_has_ui_subcommand(monkeypatch):
     monkeypatch.setattr(ui, "serve", lambda port, open_browser: seen.update(port=port, open=open_browser) or 0)
     assert cli.main(["ui", "--port", "9999", "--no-browser"]) == 0
     assert seen == {"port": 9999, "open": False}
+
+
+# ------------------------------------------------- round 2 regressions
+def _add(server, **kw):
+    d = {"type": "buy", "date": "2025-01-06", "ticker": "AAA", "quantity": "1", "price": "10"}
+    d.update(kw)
+    return post(server + "/add", d)[1]
+
+
+def test_atomic_write_keeps_symlink_and_uses_unique_temp(tmp_path):
+    real = tmp_path / "real.csv"
+    real.write_text("old")
+    link = tmp_path / "link.csv"
+    link.symlink_to(real)
+    (tmp_path / "link.csv.tmp").write_text("someone else's file")
+    ui.write_bytes_atomic(str(link), b"new")
+    assert link.is_symlink() and real.read_bytes() == b"new"
+    assert (tmp_path / "link.csv.tmp").read_text() == "someone else's file"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["link.csv", "link.csv.tmp", "real.csv"]
+
+
+def test_add_refuses_unreadable_missing_and_unbalanced_files(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    f.write_bytes((HEADER + "\n").encode() + b"2025-01-02,buy,X,1,1,,,,\n\xff\xfe\n")
+    before = f.read_bytes()
+    assert "Problem" in _add(server) and f.read_bytes() == before
+    f.write_text(HEADER + '\n2025-01-02,buy,X,1,1,,,,\n2025-01-03,buy,Y,1,1,,,"note\n')
+    before = f.read_bytes()
+    assert "Problem" in _add(server) and f.read_bytes() == before
+    f.unlink()
+    assert "file not found, choose it again or create a new one".split(",")[0] in _add(server)
+    assert not f.exists()
+    body = use_file(server, f)  # explicit create still works, then Add works
+    assert "Done" in body and "added buy" in _add(server)
+
+
+def test_sell_above_holdings_needs_save_anyway(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    _add(server, quantity="5")
+    body = _add(server, type="sell", date="2025-02-01", quantity="8", price="11")
+    assert "you would sell 8 but only hold 5 on that date. If a stock split happened, tick &#x27;save anyway&#x27;" in body
+    assert len(load_transactions(f)) == 1
+    assert "added sell" in _add(server, type="sell", date="2025-02-01", quantity="8", price="11", force_hold="1")
+
+
+def test_comma_numbers_rejected_everywhere(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    assert "ambiguous" in _add(server, quantity="1,234")
+    assert "Problem" in _add(server, quantity="1,5,5")
+    for k, v in (("amount", "1,234"), ("fee", "1,234")):
+        form = {"ticker": "VWCE.DE", "amount": "100", "start": "2025-01-01", "end": "2025-03-30", "mode": "monthly",
+                "monthly": "15", "prices": EXAMPLE_PRICES, k: v}
+        assert "ambiguous" in post(server + "/dca", form)[1]
+    assert "Problem" in post(server + "/report", {"top": "1,5", "prices": EXAMPLE_PRICES})[1]
+    assert len(f.read_text().splitlines()) == 1
+
+
+def test_ticker_and_date_normalised_and_future_note(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    assert "Problem" in _add(server, ticker="A B")
+    _add(server, ticker="vwce.de", date="03.07.2024")
+    assert "2024-07-03,buy,VWCE.DE" in f.read_text()
+    future = (pd.Timestamp.today() + pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    body = _add(server, date=future)
+    assert "added buy" in body and "in the future" in body and future in f.read_text()
+
+
+def test_stale_duplicate_plan_token_is_refused(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    form = {"ticker": "VWCE.DE", "amount": "100", "start": "2025-01-01", "end": "2025-03-30", "mode": "monthly",
+            "monthly": "15", "prices": EXAMPLE_PRICES}
+    post(server + "/dca", form)
+    _, body, url = post(server + "/dca", form)  # warning page
+    tok = re.search(r"t=([^&]+)", url).group(1)
+    with f.open("a") as fh:
+        fh.write("2025-05-05,buy,OTHER,1,1,,,,\n")  # file changed meanwhile (e.g. second tab)
+    before = f.read_bytes()
+    _, body, _ = post(server + "/dca/confirm", {"t": tok})
+    assert "the file changed, run the plan again" in body and f.read_bytes() == before
+
+
+def test_multi_step_undo(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    states = [f.read_bytes()]
+    for q in ("1", "2", "3"):
+        _add(server, quantity=q)
+        states.append(f.read_bytes())
+    for expect in (states[2], states[1], states[0]):
+        page = get(server + "/")[1]
+        assert "undo step(s) available" in page
+        post(server + "/undo", dict(re.findall(r'name="(backup|path)" value="([^"]*)"', page)))
+        assert f.read_bytes() == expect
+    assert "undo step(s) available" not in get(server + "/")[1]
+    assert len(list((tmp_path / ".portfolio_backups" / "undone").iterdir())) >= 3
+
+
+def test_undo_warns_when_file_changed_outside(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    _add(server)
+    assert "WARNING" not in get(server + "/")[1]
+    with f.open("a") as fh:
+        fh.write("2025-05-05,buy,OTHER,1,1,,,,\n")
+    assert "changed outside this app" in get(server + "/")[1]
+
+
+def test_bad_csv_path_in_settings_is_ignored(server, tmp_path):
+    s = tmp_path / ".portfolio_tracker_ui.json"
+    for raw in ('{"csv_path": "/tmp/a\\u0000b.csv"}', '{"csv_path": "/tmp/a\\ud800b.csv"}',
+                '{"csv_path": "/tmp/ok.csv", "dca": {"ticker": "\\ud800"}}'):
+        s.write_text(raw)
+        for page in ("/", "/add", "/dca", "/report"):
+            assert get(server + page)[0] == 200
+    s.write_text('{"csv_path": "/tmp/a\\u0000b.csv"}')
+    assert ui.current_path() == ui.default_csv()
+
+
+def test_unknown_benchmark_warning_visible_in_ui(server, tmp_path):
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    post(server + "/dca", {"ticker": "NQSE.DE", "amount": "40", "start": "2025-01-06", "end": "2025-06-30",
+                           "mode": "weekly", "weekday": "mon", "prices": EXAMPLE_PRICES})
+    _, body, _ = post(server + "/report", {"benchmarks": "ZZZZ", "as_of": "2025-06-30", "prices": EXAMPLE_PRICES})
+    assert 'class="warn"' in body and "benchmark ZZZZ skipped" in body
