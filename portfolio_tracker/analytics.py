@@ -24,6 +24,7 @@ from .transactions import LedgerError, Transaction
 log = logging.getLogger(__name__)
 
 QTY_EPS = 1e-9
+PRICE_TOLERANCE = 1.5  # trade price vs market close; beyond this the row is flagged
 STALE_DAYS = 7
 SHORT_HISTORY_DAYS = 365
 PERIODS = [("1W", pd.DateOffset(weeks=1)), ("1M", pd.DateOffset(months=1)), ("3M", pd.DateOffset(months=3)),
@@ -121,6 +122,7 @@ class Report:
     contributions_count: int
     warnings: list[str]
     daily: pd.DataFrame = field(repr=False, default=None)
+    problems: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- helpers
@@ -182,6 +184,7 @@ class Portfolio:
         self.benchmarks = [b.upper() for b in (benchmarks or [])]
         self.split_adjust = split_adjust
         self.warnings: list[str] = []
+        self.problems: list[str] = []
         if self.as_of > today:
             self.warnings.append(f"as-of date is in the future, valued as of {today.date()}")
             self.as_of = today
@@ -314,16 +317,28 @@ class Portfolio:
             price_df[tk] = price.fillna(0.0)
 
             if not market.empty:
+                # trade prices must be close to that day's market price (in base currency);
+                # a big mismatch almost always means a wrong currency column or pence vs pounds
+                bad, checked = [], 0
                 for t in txs:
                     if t.type == "dividend" or t.adj_price <= 0:
                         continue
                     mp = _rate_on(priced, t.date)
+                    if not mp or mp <= 0:
+                        continue
+                    checked += 1
                     tp = t.adj_price * t._rate
-                    if mp and mp > 0 and not (1 / 20 < tp / mp < 20):
-                        self.warnings.append(
-                            f"line {t.line}: {tk} price {t.price:g} {t.currency or mccy} is {tp / mp:.1f}x the market "
-                            f"price that day; check units (pence vs pounds) and the currency column"
-                        )
+                    if not (1 / PRICE_TOLERANCE < tp / mp < PRICE_TOLERANCE):
+                        bad.append((t, tp, mp))
+                if bad:
+                    t, tp, mp = bad[0]
+                    self.problems.append(
+                        f"{tk}: {len(bad)} of {checked} trade prices do not match the market price "
+                        f"(e.g. line {t.line}: {t.price:g} {t.currency or mccy} = {tp:,.2f} {self.base}, "
+                        f"market that day {mp:,.2f} {self.base}, {tp / mp:.3g}x). Usually the currency column "
+                        f"is wrong (e.g. CZK written for a EUR price) or pence and pounds are mixed up. "
+                        f"Fix those rows; the results below are NOT reliable."
+                    )
 
             last_px_date = market.index.max() if not market.empty else None
             stale = q.iloc[-1] > 0 and (last_px_date is None or (self.as_of - last_px_date).days > STALE_DAYS)
@@ -537,5 +552,5 @@ class Portfolio:
             drawdown=max_drawdown(self.index.loc[self.inception:]),
             holdings=holdings, periods=periods, alltime_contributions=alltime, benchmarks=bms,
             contributions_count=sum(1 for t in self.txs if t.type == "buy"),
-            warnings=list(dict.fromkeys(self.warnings)), daily=daily,
+            warnings=list(dict.fromkeys(self.warnings)), daily=daily, problems=list(self.problems),
         )

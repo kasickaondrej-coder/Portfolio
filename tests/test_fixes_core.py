@@ -276,3 +276,69 @@ def test_comma_file_still_rejects_ambiguous_value(tmp_path):
     p.write_text('date,type,ticker,quantity,price,fee,currency,amount,fx_rate\n2024-01-02,buy,VWCE.DE,"1,234",100,,,,\n')
     with pytest.raises(LedgerError, match="ambiguous"):
         load_transactions(p)
+
+
+# ---- savings plan in a currency other than the ticker's (bug: CZK plan on a EUR ETF)
+def _czk_prices(tmp_path):
+    p = tmp_path / "p.csv"
+    p.write_text(
+        "date,symbol,close,currency\n"
+        "2025-01-06,NQSE.DE,12.5,EUR\n2025-01-13,NQSE.DE,13.0,EUR\n"
+        "2025-01-06,EURCZK=X,25.0,CZK\n2025-01-13,EURCZK=X,25.0,CZK\n"
+        "2025-01-06,CSPX.L,50000,GBp\n2025-01-13,CSPX.L,50000,GBp\n"
+        "2025-01-06,GBPEUR=X,1.2,EUR\n2025-01-13,GBPEUR=X,1.2,EUR\n"
+    )
+    return p
+
+
+def test_dca_converts_market_price_into_plan_currency(tmp_path):
+    from portfolio_tracker import cli
+    from portfolio_tracker.transactions import load_transactions
+    prices = _czk_prices(tmp_path)
+    tx = tmp_path / "t.csv"
+    assert cli.main(["dca", str(tx), "NQSE.DE", "1000", "--currency", "CZK", "--start", "2025-01-06",
+                     "--end", "2025-01-13", "--prices", str(prices)]) == 0
+    a, b = load_transactions(tx)
+    assert a.currency == "CZK" and a.price == 312.5          # 12.5 EUR x 25 CZK/EUR
+    assert a.quantity == round(1000 / 312.5, 4)              # 3.2 units, not 80
+    assert b.price == 325.0
+
+
+def test_dca_scales_pence_tickers(tmp_path):
+    from portfolio_tracker import cli
+    from portfolio_tracker.transactions import load_transactions
+    prices = _czk_prices(tmp_path)
+    tx = tmp_path / "t.csv"
+    assert cli.main(["dca", str(tx), "CSPX.L", "100", "--start", "2025-01-06", "--end", "2025-01-06",
+                     "--prices", str(prices)]) == 0
+    (a,) = load_transactions(tx)
+    assert a.currency == "GBP" and a.price == 500.0 and a.quantity == 0.2
+
+
+def test_dca_czk_plan_report_matches_eur_plan(tmp_path):
+    from portfolio_tracker import cli
+    from portfolio_tracker.analytics import Portfolio
+    from portfolio_tracker.data import StaticProvider
+    from portfolio_tracker.transactions import load_transactions
+    prices = _czk_prices(tmp_path)
+    tx = tmp_path / "t.csv"
+    cli.main(["dca", str(tx), "NQSE.DE", "1000", "--currency", "CZK", "--start", "2025-01-06",
+              "--end", "2025-01-13", "--prices", str(prices)])
+    r = Portfolio(load_transactions(tx), StaticProvider.from_csv(prices), base="EUR", as_of="2025-01-13").report()
+    assert not r.problems
+    assert r.total_bought == pytest.approx(80.0, abs=0.01)   # 2 x 1000 CZK at 25 CZK/EUR
+    assert r.simple_return == pytest.approx((3.2 + 3.0769) * 13.0 / 80.0 - 1, abs=1e-3)
+
+
+def test_wrong_currency_column_is_reported_as_data_problem(tmp_path):
+    from portfolio_tracker.analytics import Portfolio
+    from portfolio_tracker.data import StaticProvider
+    from portfolio_tracker.report import render_text
+    from portfolio_tracker.transactions import parse_rows
+    prices = _czk_prices(tmp_path)
+    txs = parse_rows([dict(date="2025-01-06", type="buy", ticker="NQSE.DE", quantity="80", price="12.5",
+                           currency="CZK")])  # EUR price labelled CZK: the old dca bug
+    r = Portfolio(txs, StaticProvider.from_csv(prices), base="EUR", as_of="2025-01-13").report()
+    assert len(r.problems) == 1 and "1 of 1 trade prices" in r.problems[0]
+    text = render_text(r)
+    assert text.startswith("!!! DATA PROBLEM")

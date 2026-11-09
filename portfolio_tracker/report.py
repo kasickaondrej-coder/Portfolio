@@ -65,7 +65,12 @@ def plain_words(r: Report) -> list[str]:
 
 def render_text(r: Report, top_n: int = 5) -> str:
     b = r.base
-    L = ["IN PLAIN WORDS"]
+    L = []
+    if getattr(r, "problems", None):
+        L.append("!!! DATA PROBLEM: THE NUMBERS IN THIS REPORT ARE NOT RELIABLE !!!")
+        L += [f"  - {x}" for x in r.problems]
+        L.append("")
+    L += ["IN PLAIN WORDS"]
     L += [f"  {x}" for x in plain_words(r)]
     L.append("")
     L.append(f"PORTFOLIO REPORT  as of {r.as_of.date()}  base {b}")

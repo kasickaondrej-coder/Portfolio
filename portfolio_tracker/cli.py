@@ -16,7 +16,7 @@ import sys
 import pandas as pd
 
 from .analytics import Portfolio
-from .data import DataError, StaticProvider, YahooProvider
+from .data import DataError, StaticProvider, YahooProvider, fx_series, normalise_currency
 from .report import render_json, render_text
 from .transactions import LedgerError, _num, append_transaction, append_transactions, load_transactions, parse_rows
 
@@ -92,6 +92,23 @@ def cmd_dca(args, provider=None) -> int:
     closes = closes[closes > 0]
     if closes.empty:
         raise DataError(f"no prices for {args.ticker}")
+    # Market closes are in the ticker's trading currency (pence for some London tickers).
+    # The plan amount is in `currency`; convert the close into it before computing units.
+    mccy, scale = provider.currency(args.ticker)
+    wanted = normalise_currency(getattr(args, "currency", None) or "") if getattr(args, "currency", None) else None
+    ccy = wanted[0] if wanted else mccy
+    amount_scale = wanted[1] if wanted else 1.0  # amount typed in pence (GBX) -> pounds
+    amount, fee = amount * amount_scale, fee * amount_scale
+    invest = amount - fee
+    closes = closes * scale
+    if ccy != mccy:
+        fx = fx_series(provider, mccy, ccy, start - pd.Timedelta(days=14), end + pd.Timedelta(days=7))
+        fx = fx[fx > 0]
+        if fx.empty:
+            raise DataError(f"no exchange rate {mccy}->{ccy} for the plan")
+        cal = closes.index.union(fx.index)
+        rate = fx.reindex(cal).ffill().bfill().reindex(closes.index)
+        closes = closes * rate
     # compute and validate every row first; nothing is written unless all of them are fine
     rows = []
     for d in dates:
@@ -106,7 +123,7 @@ def cmd_dca(args, provider=None) -> int:
             raise LedgerError(f"{d.date()}: amount {amount:g} buys 0 units at price {price:g} with {decimals} decimals")
         rows.append((d, dict(
             date=trade_day.strftime("%Y-%m-%d"), type="buy", ticker=args.ticker.upper(),
-            quantity=qty, price=round(price, 4), fee=fee or None, currency=args.currency,
+            quantity=qty, price=round(price, 4), fee=fee or None, currency=ccy,
         )))
     for d, row in rows:
         try:
