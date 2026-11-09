@@ -1,17 +1,17 @@
-#!/usr/bin/env python3
-"""Candidate B: plain multi-page local web UI for the portfolio tracker.
+"""Plain local web UI for the portfolio tracker (standard library only).
 
-Run:  python ui_candidates/ui_b.py [--port N] [--no-browser]
+    python -m portfolio_tracker ui        (or: python -m portfolio_tracker.ui)
+    options: --port N (default 8765), --no-browser
 
-Standard library only (plus the portfolio_tracker package). Pages are
-server-rendered; every form POSTs and then redirects (POST/redirect/GET), so
-reloading a page never repeats an action. No JavaScript except one confirm()
-on the delete button.
+Pages are rendered on the server. Every form POSTs and then redirects
+(POST/redirect/GET), so reloading a page never repeats an action. The only
+JavaScript is a delete confirm() and a "please wait" banner that also blocks
+double submits. The server listens on 127.0.0.1 only and rejects requests from
+other web sites (Host and Origin checks).
 """
 from __future__ import annotations
 
 import argparse
-import argparse as _ap
 import contextlib
 import csv
 import hashlib
@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import secrets
-import socket
+import shutil
 import subprocess
 import sys
 import threading
@@ -31,35 +31,38 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.request import urlopen
+
+import pandas as pd
+
+from . import cli
+from .analytics import Portfolio
+from .data import DataError, StaticProvider, YahooProvider
+from .report import render_json, render_text
+from .transactions import CSV_COLUMNS, LedgerError, append_transaction, load_transactions
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 
-import pandas as pd  # noqa: E402
+def settings_path() -> Path:
+    return Path.home() / ".portfolio_tracker_ui.json"
 
-from portfolio_tracker import cli  # noqa: E402
-from portfolio_tracker.analytics import Portfolio  # noqa: E402
-from portfolio_tracker.data import DataError, StaticProvider, YahooProvider  # noqa: E402
-from portfolio_tracker.report import render_json, render_text  # noqa: E402
-from portfolio_tracker.transactions import (  # noqa: E402
-    CSV_COLUMNS, LedgerError, append_transaction, load_transactions)
 
-SETTINGS_PATH = Path.home() / ".portfolio_tracker_ui.json"
-DEFAULT_CSV = str(Path.home() / "Desktop" / "portfolio.csv")
+def default_csv() -> str:
+    return str(Path.home() / "Desktop" / "portfolio.csv")
+
 EXAMPLE_TX = ROOT / "examples" / "transactions_example.csv"
 EXAMPLE_PRICES = ROOT / "examples" / "prices_synthetic.csv"
 
 LOCK = threading.RLock()  # serialises file writes and settings
 RESULTS: "OrderedDict[str, dict]" = OrderedDict()  # report results kept in memory
 FLASH: "OrderedDict[str, dict]" = OrderedDict()  # one-shot messages + form values
-PORT = 0
 
 # ----------------------------------------------------------------- settings
 
 
 def load_settings() -> dict:
     try:
-        d = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        d = json.loads(settings_path().read_text(encoding="utf-8"))
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
@@ -70,13 +73,13 @@ def save_settings(**updates) -> None:
         s = load_settings()
         s.update(updates)
         try:
-            SETTINGS_PATH.write_text(json.dumps(s, indent=2), encoding="utf-8")
+            settings_path().write_text(json.dumps(s, indent=2), encoding="utf-8")
         except OSError:
             pass  # settings are a convenience only
 
 
 def current_path() -> str:
-    return load_settings().get("csv_path") or DEFAULT_CSV
+    return load_settings().get("csv_path") or default_csv()
 
 
 def expand(p: str) -> str:
@@ -99,7 +102,7 @@ def num(raw: str, name: str, default=None, kind=float):
     if raw == "":
         if default is None:
             raise UserError(f"{name} is required")
-        return default
+        return kind(default)
     try:
         v = float(raw.replace(",", ".")) if kind is float else int(raw)
     except ValueError:
@@ -125,7 +128,7 @@ def check_date(raw: str, name: str, required=True):
 def friendly(e: BaseException) -> str:
     if isinstance(e, (LedgerError, DataError, UserError)):
         return str(e)
-    logging.getLogger("ui_b").error("unexpected error:\n%s", traceback.format_exc())
+    logging.getLogger("portfolio_tracker.ui").error("unexpected error:\n%s", traceback.format_exc())
     return f"Unexpected error ({type(e).__name__}): {e}. Nothing was changed unless stated above."
 
 
@@ -175,16 +178,14 @@ def delete_line(path: str, line: int, signature: str) -> str:
     i = hit[0]
     removed = rows[i][1]
     tmp = path + ".tmp"
-    with open(path + ".bak", "w", newline="", encoding="utf-8") as b, \
-            open(path, newline="", encoding="utf-8-sig") as src:
-        b.write(src.read())
+    shutil.copy2(path, path + ".bak")  # keep the previous version
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=delim)
         for j, (_, row) in enumerate(rows):
             if j != i:
                 w.writerow(row)
     os.replace(tmp, path)
-    return ",".join(removed)
+    return " | ".join(removed)
 
 
 # --------------------------------------------------------------- page layout
@@ -213,12 +214,28 @@ td.l,th.l{{text-align:left}}
 label{{display:block;margin:.4em 0}} input[type=text]{{padding:2px}}
 pre{{background:#f6f6f6;border:1px solid #bbb;padding:.5em;overflow:auto}}
 small{{color:#555}} fieldset{{margin:1em 0}}
+#busy{{display:none;position:fixed;top:0;left:0;right:0;background:#ffd;border-bottom:2px solid #c90;padding:.6em;text-align:center}}
 </style></head><body>
+<div id="busy"><b>Working, please wait...</b> Downloading prices can take a minute. Do not click again.</div>
 <nav>{menu}</nav>
 <p><small>File in use: <code>{esc(current_path())}</code></small></p>
 <h1>{esc(title)}</h1>
 {msg}
 {body}
+<script>
+// Show "please wait" and ignore a second click while a form is being processed.
+document.addEventListener("submit", function (e) {{
+  var f = e.target;
+  if (e.defaultPrevented) return;
+  if (f.dataset.sent) {{ e.preventDefault(); return; }}
+  f.dataset.sent = "1";
+  document.getElementById("busy").style.display = "block";
+}});
+window.addEventListener("pageshow", function () {{  // back button: reset
+  document.getElementById("busy").style.display = "none";
+  document.querySelectorAll("form").forEach(function (f) {{ delete f.dataset.sent; }});
+}});
+</script>
 </body></html>"""
     return page.encode("utf-8")
 
@@ -240,8 +257,9 @@ def page_transactions(fl, q) -> bytes:
     p = Path(expand(path))
     browse = ""
     if sys.platform == "darwin":
-        browse = ('<form method="post" action="/browse" style="display:inline"> '
-                  '<button>Browse in Finder...</button></form>')
+        browse = ('<form method="post" action="/browse"><p>Or pick with Finder: '
+                  '<button name="mode" value="open">Choose an existing file...</button> '
+                  '<button name="mode" value="new">Make a new file...</button></p></form>')
     body = f"""
 <form method="post" action="/setfile">
 {field("CSV file path", "path", path, 60, "full path, e.g. /Users/you/Desktop/portfolio.csv (~ is allowed)")}
@@ -267,6 +285,8 @@ def table_html(p: Path) -> str:
     except Exception as e:
         return f'<div class="err">Cannot read the file: {esc(friendly(e))}</div>'
     sigs = {ln: sig(row) for ln, row in raw[1:]}
+    if not any(any(c.strip() for c in row) for _, row in raw[1:]):
+        return "<p>No transactions yet. Add some on the <a href=\"/add\">Add</a> or <a href=\"/dca\">Savings plan</a> page.</p>"
     try:
         txs = load_transactions(p)
     except LedgerError as e:
@@ -528,20 +548,13 @@ def do_dca(f: dict) -> str | list:
         if dups:
             return dups
     provider = make_provider(f.get("prices", ""), f.get("cache_dir", ""), f.get("offline") == "1")
-    args = _ap.Namespace(transactions=path, ticker=ticker, amount=amount, start=start, end=end,
+    args = argparse.Namespace(transactions=path, ticker=ticker, amount=amount, start=start, end=end,
                          weekday=f.get("weekday", "mon") if f.get("weekday") in cli.WEEKDAYS else "mon",
                          monthly=monthly, fee=fee, currency=(f.get("currency") or "").strip() or None,
                          decimals=decimals, prices=None, cache_dir=None, offline=False)
-    # cmd_dca takes the provider from args; hand it ours
-    orig = cli._provider
     buf = io.StringIO()
-    with LOCK:
-        cli._provider = lambda a: provider
-        try:
-            with contextlib.redirect_stdout(buf):
-                cli.cmd_dca(args)
-        finally:
-            cli._provider = orig
+    with LOCK, contextlib.redirect_stdout(buf):
+        cli.cmd_dca(args, provider=provider)
     save_settings(dca={k: f.get(k, "") for k in ("ticker", "amount", "start", "end", "mode", "weekday", "monthly",
                                                  "fee", "currency", "decimals", "prices", "cache_dir", "offline")})
     return buf.getvalue().strip() or "plan created"
@@ -566,15 +579,24 @@ def do_setfile(f: dict) -> str:
     return f"now using {p}" + ("" if p.exists() else " (file does not exist yet)")
 
 
-def do_browse() -> str:
-    script = ('POSIX path of (choose file name with prompt "Choose or name your portfolio CSV file" '
-              'default name "portfolio.csv")')
-    out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=300)
-    if out.returncode != 0:
+def do_browse(mode: str) -> str:
+    """macOS only: let the user pick the file in a Finder dialog."""
+    if mode == "new":
+        pick = ('choose file name with prompt "Name your new transactions file" '
+                'default name "portfolio.csv" default location (path to desktop folder)')
+    else:
+        pick = 'choose file with prompt "Choose your transactions CSV file"'
+    script = f"activate\nPOSIX path of ({pick})"  # activate: bring the dialog to the front
+    out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=600)
+    if out.returncode != 0 or not out.stdout.strip():
         raise UserError("no file chosen")
-    p = out.stdout.strip()
-    save_settings(csv_path=p)
-    return f"now using {p}" + ("" if Path(p).exists() else " (use 'Create new empty file here' to create it)")
+    p = Path(out.stdout.strip())
+    if mode == "new" and not p.exists():
+        p.write_text(",".join(CSV_COLUMNS) + "\n", encoding="utf-8")
+        save_settings(csv_path=str(p))
+        return f"created {p} and selected it"
+    save_settings(csv_path=str(p))
+    return f"now using {p}"
 
 
 # ------------------------------------------------------------------- server
@@ -602,8 +624,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def allowed(self) -> tuple:
+        port = self.server.server_address[1]
+        return f"127.0.0.1:{port}", f"localhost:{port}"
+
     def host_ok(self) -> bool:
-        return (self.headers.get("Host") or "") in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+        return (self.headers.get("Host") or "") in self.allowed()
 
     def do_GET(self):
         if not self.host_ok():
@@ -630,8 +656,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send(layout("Error", f'<div class="err">{esc(friendly(e))}</div>', ""), 500)
 
     def do_POST(self):
-        if not self.host_ok() or urlparse(self.headers.get("Origin") or f"http://127.0.0.1:{PORT}").netloc not in (
-                f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
+        origin = self.headers.get("Origin")
+        if not self.host_ok() or (origin and urlparse(origin).netloc not in self.allowed()):
             return self.send(b"forbidden", 403, "text/plain")
         n = int(self.headers.get("Content-Length") or 0)
         form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True).items()}
@@ -645,7 +671,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/setfile":
                     tok = flash("ok", do_setfile(form))
                 elif path == "/browse":
-                    tok = flash("ok", do_browse())
+                    tok = flash("ok", do_browse(form.get("mode", "open")))
                 elif path == "/delete":
                     p = expand(current_path())
                     removed = delete_line(p, int(form.get("line", "0") or 0), form.get("sig", ""))
@@ -670,34 +696,52 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect(f"{back}?{urlencode({'f': tok})}")
 
 
-def make_server(port: int):
-    for p in (port, 0):
-        try:
-            return ThreadingHTTPServer(("127.0.0.1", p), Handler)
-        except OSError:
-            if p == 0:
-                raise
-            print(f"Port {port} is busy, picking a free one.")
+def already_running(port: int) -> bool:
+    """True if this UI is already serving on that port (e.g. the launcher was double-clicked twice)."""
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
+            return r.headers.get("Server", "").startswith("PortfolioUI")
+    except Exception:
+        return False
 
 
-def main(argv=None):
-    global PORT
-    ap = argparse.ArgumentParser(description="Portfolio tracker local web UI (candidate B)")
-    ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--no-browser", action="store_true")
-    a = ap.parse_args(argv)
+def make_server(port: int) -> ThreadingHTTPServer:
+    """Bind to 127.0.0.1:port, or to a free port if that one is taken. port=0 always picks a free port."""
+    try:
+        return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        print(f"Port {port} is busy, picking a free one.")
+        return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+
+def serve(port: int = 8765, open_browser: bool = True) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-    srv = make_server(a.port)
-    PORT = srv.server_address[1]
-    url = f"http://127.0.0.1:{PORT}/"
-    print(f"Portfolio tracker is running at {url}\nPress Ctrl+C in this window to stop it.", flush=True)
-    if not a.no_browser:
+    if port and already_running(port):
+        url = f"http://127.0.0.1:{port}/"
+        print(f"Portfolio tracker is already running at {url}; opening it.")
+        if open_browser:
+            webbrowser.open(url)
+        return 0
+    srv = make_server(port)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    print(f"Portfolio tracker is running at {url}\n"
+          "Keep this window open while you use it. To stop, close this window (or press Ctrl+C).", flush=True)
+    if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m portfolio_tracker.ui", description="Portfolio tracker local web page")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    a = ap.parse_args(argv)
+    return serve(a.port, open_browser=not a.no_browser)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

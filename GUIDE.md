@@ -1,5 +1,32 @@
 # User guide
 
+## Using the app without commands
+
+You can do everything in this guide from a simple page in your web browser (Safari or Chrome), without typing commands.
+
+1. In Finder, open the `Portfolio` folder and double-click **`Start Portfolio Tracker.command`**.
+2. The first time, macOS may refuse to open it ("cannot be opened because it is from an unidentified developer"). Right-click the file, choose **Open**, then **Open** again. You only do this once.
+3. The first start takes a few minutes while it installs what it needs (internet required). After that it starts in a few seconds.
+4. Your browser opens the page. A Terminal window stays open next to it: **close that window to stop the app**. If you close only the browser tab, double-click the file again to get it back.
+
+The menu at the top has these pages:
+
+| Page | What it does |
+|---|---|
+| Transactions | Choose your transactions file (type the path, or use the Finder buttons), or create a new empty one. Shows all rows, sorted by date. **Delete** removes one row after asking; the previous version of the file is kept next to it as `yourfile.csv.bak` |
+| Add | Add one buy, sell or dividend, with all the columns of section 4 (fee, currency, FX rate are optional) |
+| Savings plan | Writes all the buys of a regular plan (every week on a weekday, or every month on a day) at market closing prices, like the `dca` command in section 8. If buys of that ticker already exist in that period, it warns you before writing anything |
+| Report | Runs the report on your file with every option of section 9: base currency, as-of date, one or more benchmarks (separate them with commas), top movers, offline, already split-adjusted quantities, offline prices file, cache folder. Below the report are links to download it as JSON and the daily values as CSV (for Excel) |
+| Example | Runs the built-in example report. It does not touch your own file and needs no internet |
+
+- The file in use is shown at the top of every page, and the app remembers it next time.
+- After pressing a button, a yellow "Working, please wait" bar appears. Downloading prices from Yahoo can take a minute; do not click again.
+- Errors are shown in a red box saying what to fix. A form with a mistake writes nothing to your file.
+- Reloading the page never adds a transaction twice.
+- From the terminal the same page starts with `python -m portfolio_tracker ui`.
+
+The rest of this guide explains the same features as terminal commands, and what the numbers mean.
+
 ## 1. Start a session (every time)
 
 ```

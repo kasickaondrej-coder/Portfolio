@@ -2,6 +2,16 @@
 
 Step by step usage: see [GUIDE.md](GUIDE.md).
 
+## No-command app (macOS)
+
+Double-click `Start Portfolio Tracker.command`. The first time it creates `.venv` and installs the requirements, then opens a local page in the browser (`http://127.0.0.1:8765`) for every command below: choose or create the transactions file, view and delete rows, add transactions, savings plans, reports with all options (JSON and daily CSV downloads) and the example. Close the Terminal window to stop it. The same page starts with:
+
+```
+python -m portfolio_tracker ui            # or: python -m portfolio_tracker.ui   (--port N, --no-browser)
+```
+
+It uses the standard library only, listens on 127.0.0.1 only, rejects requests from other sites, never repeats an action on reload, warns before a savings plan that would duplicate existing buys, and keeps `file.csv.bak` before deleting a row.
+
 A portfolio tracker for dated buy/sell/dividend transactions in ETFs and stocks. It values the portfolio every day from Yahoo Finance prices, so the returns account for when each contribution was made.
 
 ## Install

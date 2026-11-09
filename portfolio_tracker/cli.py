@@ -3,6 +3,7 @@
     python -m portfolio_tracker report transactions.csv --base EUR --benchmark VWCE.DE
     python -m portfolio_tracker add transactions.csv buy VWCE.DE 2.5 118.40 --date 2025-03-03 --fee 1
     python -m portfolio_tracker dca transactions.csv NQSE.DE 40 --start 2024-11-11 --weekday mon
+    python -m portfolio_tracker ui      (local web page in the browser, no commands needed)
 """
 from __future__ import annotations
 
@@ -50,9 +51,9 @@ def cmd_add(args) -> int:
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4}
 
 
-def cmd_dca(args) -> int:
+def cmd_dca(args, provider=None) -> int:
     """Append a regular savings plan (fixed amount on a fixed weekday or day of month) using market closes."""
-    provider = _provider(args)
+    provider = provider or _provider(args)
     start = pd.Timestamp(args.start).normalize()
     end = pd.Timestamp(args.end).normalize() if args.end else pd.Timestamp.today().normalize()
     if args.monthly:
@@ -131,7 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--cache-dir")
     d.add_argument("--offline", action="store_true")
     d.set_defaults(func=cmd_dca)
+
+    u = sub.add_parser("ui", help="open the local web page (all of the above without typing commands)")
+    u.add_argument("--port", type=int, default=8765)
+    u.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    u.set_defaults(func=cmd_ui)
     return ap
+
+
+def cmd_ui(args) -> int:
+    from .ui import serve
+    return serve(args.port, open_browser=not args.no_browser)
 
 
 def main(argv=None) -> int:
