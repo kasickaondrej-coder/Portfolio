@@ -157,8 +157,9 @@ class TestLoadTransactions:
 
     def test_example_file_loads(self):
         txs = load_transactions(EXAMPLE_TX)
-        assert len(txs) == 38  # 39 non-empty lines minus header
-        assert {"buy", "sell", "dividend"} == {t.type for t in txs}
+        assert len(txs) == 105  # 2 years of weekly Monday buys
+        assert {t.type for t in txs} == {"buy"}
+        assert {t.ticker for t in txs} == {"NQSE.DE"}
 
 
 # ============================================================ append_transaction
@@ -488,43 +489,43 @@ class TestYahooProvider:
 class TestCliEndToEnd:
     def test_report_text_exit_zero(self):
         r = run_cli("report", "examples/transactions_example.csv", "--prices", "examples/prices_synthetic.csv",
-                    "--as-of", "2025-10-31", "--benchmark", "VWCE.DE")
+                    "--as-of", "2026-11-09", "--benchmark", "VWCE.DE")
         assert r.returncode == 0, r.stderr
         assert "XIRR" in r.stdout
         assert r.stderr.strip() == "" or "error" not in r.stderr.lower()
 
     def test_report_json_parses(self):
         r = run_cli("report", "examples/transactions_example.csv", "--prices", "examples/prices_synthetic.csv",
-                    "--as-of", "2025-10-31", "--benchmark", "VWCE.DE", "--json")
+                    "--as-of", "2026-11-09", "--benchmark", "VWCE.DE", "--json")
         assert r.returncode == 0, r.stderr
         data = json.loads(r.stdout)
         for key in ("xirr", "periods", "holdings"):
             assert key in data
         assert isinstance(data["holdings"], list) and data["holdings"]
         assert isinstance(data["periods"], list) and data["periods"]
-        assert {h["ticker"] for h in data["holdings"]} >= {"VWCE.DE", "AAPL"}
+        assert {h["ticker"] for h in data["holdings"]} == {"NQSE.DE"}
 
     def test_export_daily_writes_csv(self, tmp_path):
         out = tmp_path / "daily.csv"
         r = run_cli("report", "examples/transactions_example.csv", "--prices", "examples/prices_synthetic.csv",
-                    "--as-of", "2025-10-31", "--export-daily", str(out))
+                    "--as-of", "2026-11-09", "--export-daily", str(out))
         assert r.returncode == 0, r.stderr
         df = pd.read_csv(out)
         assert len(df) > 100
         assert "date" in df.columns
-        assert pd.to_datetime(df["date"]).max() <= pd.Timestamp("2025-10-31")
+        assert pd.to_datetime(df["date"]).max() <= pd.Timestamp("2026-11-09")
 
     def test_add_subcommand_appends_row(self, tmp_path):
         tx = tmp_path / "my.csv"
         tx.write_text(EXAMPLE_TX.read_text())
         before = len(load_transactions(tx))
-        r = run_cli("add", str(tx), "buy", "VWCE.DE", "1.5", "110.25", "--date", "2025-11-03", "--fee", "1")
+        r = run_cli("add", str(tx), "buy", "VWCE.DE", "1.5", "110.25", "--date", "2026-11-16", "--fee", "1")
         assert r.returncode == 0, r.stderr
         txs = load_transactions(tx)
         assert len(txs) == before + 1
         added = txs[-1]
         assert (added.type, added.ticker, added.quantity, added.price, added.fee) == ("buy", "VWCE.DE", 1.5, 110.25, 1.0)
-        assert added.date == pd.Timestamp("2025-11-03")
+        assert added.date == pd.Timestamp("2026-11-16")
 
     def test_add_dividend_subcommand(self, tmp_path):
         tx = tmp_path / "new.csv"
@@ -535,7 +536,7 @@ class TestCliEndToEnd:
 
     def test_bad_file_exit_2_with_message(self, tmp_path):
         bad = write(tmp_path / "bad.csv", f"{HEADER}\n2024-01-02,buy,VWCE.DE,1,100,,,,\n2024-99-99,buy,VWCE.DE,1,100,,,,\n")
-        r = run_cli("report", str(bad), "--prices", str(EXAMPLE_PRICES), "--as-of", "2025-10-31")
+        r = run_cli("report", str(bad), "--prices", str(EXAMPLE_PRICES), "--as-of", "2026-11-09")
         assert r.returncode == 2
         assert "error:" in r.stderr
         assert "line 3" in r.stderr
@@ -553,3 +554,36 @@ class TestCliEndToEnd:
         assert code == 2
         assert "error:" in captured.err
         assert "quantity" in captured.err
+
+
+# ============================================================ dca subcommand
+class TestDcaSubcommand:
+    def test_weekly_monday_plan(self, tmp_path):
+        tx = tmp_path / "plan.csv"
+        code = cli.main(["dca", str(tx), "NQSE.DE", "40", "--start", "2025-01-06", "--end", "2025-03-31",
+                         "--prices", str(EXAMPLE_PRICES)])
+        assert code == 0
+        txs = load_transactions(tx)
+        assert len(txs) == 13
+        assert all(t.date.dayofweek == 0 for t in txs)
+        assert all(t.quantity * t.price == pytest.approx(40, abs=0.01) for t in txs)
+
+    def test_holiday_moves_to_next_trading_day_and_fee(self, tmp_path):
+        prices = write(tmp_path / "p.csv", "date,symbol,close,currency\n"
+                       "2025-04-22,ABC,10,EUR\n2025-04-28,ABC,20,EUR\n")  # Easter Monday 2025-04-21 missing
+        tx = tmp_path / "plan.csv"
+        code = cli.main(["dca", str(tx), "ABC", "41", "--start", "2025-04-21", "--end", "2025-04-28",
+                         "--fee", "1", "--prices", str(prices)])
+        assert code == 0
+        a, b = load_transactions(tx)
+        assert a.date == pd.Timestamp("2025-04-22") and a.quantity == pytest.approx(4.0) and a.fee == 1
+        assert b.date == pd.Timestamp("2025-04-28") and b.quantity == pytest.approx(2.0)
+
+    def test_monthly_plan(self, tmp_path):
+        tx = tmp_path / "plan.csv"
+        code = cli.main(["dca", str(tx), "VWCE.DE", "200", "--start", "2025-01-01", "--end", "2025-06-30",
+                         "--monthly", "15", "--prices", str(EXAMPLE_PRICES)])
+        assert code == 0
+        txs = load_transactions(tx)
+        assert len(txs) == 6
+        assert all(15 <= t.date.day <= 21 for t in txs)

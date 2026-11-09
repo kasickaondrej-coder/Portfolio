@@ -126,6 +126,24 @@ python -m portfolio_tracker add my.csv buy AAPL 1 190 --date 2025-04-01 --curren
 - Without `--date`, today's date is used.
 - The file is created if it does not exist.
 
+### Savings plans in one command
+
+For a fixed amount on a fixed day, `dca` writes all the buys for you. It uses each day's real Yahoo closing price, and if the plan day is a holiday the buy moves to the next trading day.
+
+```
+# 40 EUR of NQSE.DE every Monday since 11 Nov 2024 (until today)
+python -m portfolio_tracker dca my.csv NQSE.DE 40 --start 2024-11-11 --weekday mon
+
+# 200 EUR of VWCE.DE on the 15th of every month, 1 EUR fee included in the 200
+python -m portfolio_tracker dca my.csv VWCE.DE 200 --start 2024-01-01 --monthly 15 --fee 1
+```
+
+- `--end YYYY-MM-DD` stops the plan at that date instead of today.
+- `--weekday` takes `mon` to `fri`.
+- Quantities are the amount (minus the fee) divided by the closing price, to 4 decimals. Change that with `--decimals`.
+- These are estimates. Your broker's real execution prices differ slightly, so for exact numbers enter the trades from your broker's statement.
+- Running the command twice adds the buys twice, so run it once per plan.
+
 ## 9. Running the report
 
 ```

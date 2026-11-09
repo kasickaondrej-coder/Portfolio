@@ -47,6 +47,13 @@ python -m portfolio_tracker add my.csv buy VWCE.DE 2.5 105.10 --date 2024-01-02 
 python -m portfolio_tracker add my.csv dividend AAPL 0 2.40 --date 2024-08-15 --currency USD
 ```
 
+To generate a regular savings plan from market closes, for example 40 EUR every Monday (a holiday moves to the next trading day):
+
+```
+python -m portfolio_tracker dca my.csv NQSE.DE 40 --start 2024-11-11 --weekday mon
+python -m portfolio_tracker dca my.csv VWCE.DE 200 --start 2024-01-01 --monthly 15 --fee 1
+```
+
 ## Report
 
 ```
@@ -59,10 +66,10 @@ Try it without network access:
 
 ```
 python -m portfolio_tracker report examples/transactions_example.csv \
-    --prices examples/prices_synthetic.csv --as-of 2025-10-31 --benchmark VWCE.DE
+    --prices examples/prices_synthetic.csv --as-of 2026-11-09 --benchmark VWCE.DE
 ```
 
-The example prices are synthetic random walks, not real market data.
+The example is 2 years of buying NQSE.DE for 40 EUR every Monday (2024-11-11 to 2026-11-09). The example prices are synthetic random walks, not real market data. To build the same plan from real Yahoo prices, use the `dca` command.
 
 ## What it computes
 
