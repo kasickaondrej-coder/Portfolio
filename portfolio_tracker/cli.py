@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+import re
 import sys
 
 import pandas as pd
@@ -16,7 +18,7 @@ import pandas as pd
 from .analytics import Portfolio
 from .data import DataError, StaticProvider, YahooProvider
 from .report import render_json, render_text
-from .transactions import LedgerError, append_transaction, load_transactions
+from .transactions import LedgerError, _num, append_transaction, append_transactions, load_transactions, parse_rows
 
 
 def _provider(args):
@@ -48,28 +50,50 @@ def cmd_add(args) -> int:
     return 0
 
 
+def _plan_number(raw, name: str) -> float:
+    """Same parsing rules as the transactions file (rejects 1,234 as ambiguous, nan and inf)."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return 0.0
+    try:
+        return _num(str(raw), name, 0)
+    except LedgerError as e:
+        raise LedgerError(re.sub(r"^line \d+: ", "", str(e))) from None
+
+
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4}
 
 
 def cmd_dca(args, provider=None) -> int:
     """Append a regular savings plan (fixed amount on a fixed weekday or day of month) using market closes."""
     provider = provider or _provider(args)
+    amount = _plan_number(args.amount, "amount")
+    fee = _plan_number(getattr(args, "fee", None), "fee")
+    decimals = int(getattr(args, "decimals", 4))
     start = pd.Timestamp(args.start).normalize()
     end = pd.Timestamp(args.end).normalize() if args.end else pd.Timestamp.today().normalize()
     if args.monthly:
-        dates = [d for d in pd.date_range(start, end, freq="D") if d.day == args.monthly]
+        day = int(args.monthly)
+        if not 1 <= day <= 31:
+            raise LedgerError("monthly day must be between 1 and 31")
+        dates = []
+        for m in pd.period_range(start, end, freq="M"):
+            # day 29-31 in a shorter month: use the last day of that month
+            d = pd.Timestamp(m.year, m.month, min(day, m.days_in_month))
+            if start <= d <= end:
+                dates.append(d)
     else:
         dates = list(pd.date_range(start, end, freq="W-" + args.weekday.upper()))
     if not dates:
         raise LedgerError("no plan dates in that range")
+    invest = amount - fee
+    if invest <= 0:
+        raise LedgerError("amount must be larger than the fee")
     closes = provider.close(args.ticker, start - pd.Timedelta(days=7), end + pd.Timedelta(days=7))
     closes = closes[closes > 0]
     if closes.empty:
         raise DataError(f"no prices for {args.ticker}")
-    invest = args.amount - args.fee
-    if invest <= 0:
-        raise LedgerError("amount must be larger than the fee")
-    added = 0
+    # compute and validate every row first; nothing is written unless all of them are fine
+    rows = []
     for d in dates:
         # holiday or weekend: execute on the next trading day with a price (within 6 days)
         nxt = closes.loc[d: d + pd.Timedelta(days=6)]
@@ -77,13 +101,21 @@ def cmd_dca(args, provider=None) -> int:
             print(f"skipped {d.date()}: no price yet")
             continue
         trade_day, price = nxt.index[0], float(nxt.iloc[0])
-        append_transaction(
-            args.transactions, date=trade_day.strftime("%Y-%m-%d"), type="buy", ticker=args.ticker.upper(),
-            quantity=round(invest / price, args.decimals), price=round(price, 4), fee=args.fee or None,
-            currency=args.currency,
-        )
-        added += 1
-    print(f"added {added} buys of {args.ticker.upper()} ({args.amount:g} each) to {args.transactions}")
+        qty = round(invest / price, decimals)
+        if not math.isfinite(qty) or qty <= 0:
+            raise LedgerError(f"{d.date()}: amount {amount:g} buys 0 units at price {price:g} with {decimals} decimals")
+        rows.append((d, dict(
+            date=trade_day.strftime("%Y-%m-%d"), type="buy", ticker=args.ticker.upper(),
+            quantity=qty, price=round(price, 4), fee=fee or None, currency=args.currency,
+        )))
+    for d, row in rows:
+        try:
+            parse_rows([{k: "" if v is None else str(v) for k, v in row.items()}], lines=[0])
+        except LedgerError as e:
+            raise LedgerError(f"{d.date()}: {str(e)}") from None
+    if rows:
+        append_transactions(args.transactions, [r for _, r in rows])
+    print(f"added {len(rows)} buys of {args.ticker.upper()} ({amount:g} each) to {args.transactions}")
     return 0
 
 
@@ -120,12 +152,12 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("dca", help="append a regular savings plan (e.g. 40 EUR every Monday) priced at market closes")
     d.add_argument("transactions")
     d.add_argument("ticker")
-    d.add_argument("amount", type=float, help="money spent per purchase, fee included")
+    d.add_argument("amount", type=str, help="money spent per purchase, fee included")
     d.add_argument("--start", required=True, help="first plan date YYYY-MM-DD")
     d.add_argument("--end", help="last plan date (default today)")
     d.add_argument("--weekday", choices=sorted(WEEKDAYS, key=WEEKDAYS.get), default="mon", help="weekly plan day (default mon)")
     d.add_argument("--monthly", type=int, metavar="DAY", help="monthly plan on this day of month instead of weekly")
-    d.add_argument("--fee", type=float, default=0.0, help="fee per purchase, taken out of the amount")
+    d.add_argument("--fee", type=str, default=0.0, help="fee per purchase, taken out of the amount")
     d.add_argument("--currency", help="currency of the amount/price if not the ticker's own")
     d.add_argument("--decimals", type=int, default=4, help="decimals for fractional units (default 4)")
     d.add_argument("--prices", help="offline prices CSV instead of Yahoo")

@@ -36,9 +36,37 @@ def _table(headers: list[str], rows: list[list[str]], align: Optional[str] = Non
     return "\n".join(out)
 
 
+def plain_words(r: Report) -> list[str]:
+    """Three to five short sentences summarising the report for non-experts."""
+    b = r.base
+    word = "gain" if r.total_pl >= 0 else "loss"
+    first = (f"You put in {money(r.total_bought, b)} and it is worth {money(r.value, b)} now: "
+             f"a {word} of {money(abs(r.total_pl), b)} ({pct(r.simple_return)})")
+    if r.total_sold or r.dividends:
+        first += ", counting sales and dividends"
+    out = [first + "."]
+    if r.xirr is not None and math.isfinite(r.xirr):
+        extra = " (short history, so this is only a rough guide)" if r.short_history else ""
+        out.append(f"Per year, your money earned {pct(r.xirr)} (XIRR){extra}.")
+    month = next((p for p in r.periods if p.label == "1M"), None)
+    if month is not None and month.abs_pl is not None and math.isfinite(month.abs_pl):
+        out.append(f"Last month: {month.abs_pl:+,.2f} {b}.")
+    contribs = [c for c in r.alltime_contributions if c.abs_pl is not None]
+    if contribs:
+        best = max(contribs, key=lambda c: c.abs_pl)
+        worst = min(contribs, key=lambda c: c.abs_pl)
+        txt = f"Best holding all time: {best.ticker} ({best.abs_pl:+,.2f} {b})"
+        if worst is not best:
+            txt += f"; worst: {worst.ticker} ({worst.abs_pl:+,.2f} {b})"
+        out.append(txt + ".")
+    return out
+
+
 def render_text(r: Report, top_n: int = 5) -> str:
     b = r.base
-    L = []
+    L = ["IN PLAIN WORDS"]
+    L += [f"  {x}" for x in plain_words(r)]
+    L.append("")
     L.append(f"PORTFOLIO REPORT  as of {r.as_of.date()}  base {b}")
     L.append(f"History: {r.inception.date()} to {r.as_of.date()} ({r.days} days), {r.contributions_count} buy transactions")
     L.append("")

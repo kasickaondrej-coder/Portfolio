@@ -37,6 +37,14 @@ class DataError(RuntimeError):
     pass
 
 
+def _unreachable(symbol: str) -> str:
+    return f"could not reach Yahoo Finance for {symbol} (check your internet connection and try again)"
+
+
+def _no_saved(symbol: str) -> str:
+    return f"no saved data for {symbol} yet: run once with internet (untick Offline)"
+
+
 class Provider(Protocol):
     def close(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp, adjusted: bool = False) -> pd.Series: ...
     def currency(self, symbol: str) -> tuple[str, float]: ...
@@ -191,7 +199,8 @@ class YahooProvider:
             except Exception as e:  # rate limits, network errors
                 last_err = e
                 time.sleep(2 ** attempt)
-        raise DataError(f"download failed for {symbol}: {last_err}")
+        log.debug("yfinance error for %s: %s", symbol, last_err)
+        raise DataError(_unreachable(symbol)) from last_err
 
     def close(self, symbol, start, end, adjusted=False):
         """Daily closes. Refreshed at most once per day. Because Yahoo rescales history
@@ -217,7 +226,7 @@ class YahooProvider:
         )
         if not fresh and self.offline:
             if cached.empty:
-                log.warning("offline and no cached prices for %s", symbol)
+                raise DataError(_no_saved(symbol))
             else:
                 log.warning("offline: using cached prices for %s (last %s)", symbol, cached.index.max().date())
         elif not fresh:
@@ -265,11 +274,14 @@ class YahooProvider:
             try:
                 code = self._yf().Ticker(symbol).fast_info["currency"]
             except Exception as e:
-                raise DataError(f"could not get currency for {symbol}: {e}") from e
+                log.debug("yfinance error for %s: %s", symbol, e)
+                raise DataError(_unreachable(symbol)) from e
             if code:
                 table[symbol] = code
                 pd.Series(table, name="currency").to_csv(p)
         res = normalise_currency(code)
+        if res is None and self.offline:
+            raise DataError(_no_saved(symbol))
         if res is None:
             raise DataError(f"no currency for {symbol}; set the currency column in the transactions file")
         self._ccy[symbol] = res
@@ -296,21 +308,34 @@ class YahooProvider:
         return s
 
 
+def _fx_close(provider: Provider, symbol: str, start, end) -> pd.Series:
+    try:
+        s = provider.close(symbol, start, end)
+    except DataError as e:
+        if "could not reach" in str(e):
+            raise
+        return pd.Series(dtype=float)  # e.g. offline without saved data: try the other routes
+    return s[s > 0]
+
+
 def fx_series(provider: Provider, ccy: str, base: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
     """Units of `base` per 1 unit of `ccy`, daily close, may have gaps. 1.0 if same currency."""
     if ccy == base:
         return pd.Series(1.0, index=pd.date_range(start, end, freq="D"))
-    direct = provider.close(f"{ccy}{base}=X", start, end)
-    direct = direct[direct > 0]
+    direct = _fx_close(provider, f"{ccy}{base}=X", start, end)
     if not direct.empty:
         return direct
-    inverse = provider.close(f"{base}{ccy}=X", start, end)
-    inverse = inverse[inverse > 0]
+    inverse = _fx_close(provider, f"{base}{ccy}=X", start, end)
     if not inverse.empty:
         return 1.0 / inverse
     if ccy != "USD" and base != "USD":  # cross via USD
-        a = fx_series(provider, ccy, "USD", start, end)
-        b = fx_series(provider, "USD", base, start, end)
-        cal = a.index.union(b.index)
-        return (a.reindex(cal).ffill() * b.reindex(cal).ffill()).dropna()
-    raise DataError(f"no FX data for {ccy}->{base}")
+        try:
+            a = fx_series(provider, ccy, "USD", start, end)
+            b = fx_series(provider, "USD", base, start, end)
+        except DataError as e:
+            if "could not reach" in str(e):
+                raise
+        else:
+            cal = a.index.union(b.index)
+            return (a.reindex(cal).ffill() * b.reindex(cal).ffill()).dropna()
+    raise DataError(f"no exchange rate {ccy}->{base} available (needs internet, or add it to the prices file)")

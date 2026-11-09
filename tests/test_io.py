@@ -304,7 +304,7 @@ class TestFxSeries:
 
     def test_no_fx_data_raises(self):
         sp = StaticProvider({})
-        with pytest.raises(DataError, match="no FX data"):
+        with pytest.raises(DataError, match="no exchange rate JPY->EUR"):
             fx_series(sp, "JPY", "EUR", pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-03"))
 
 
@@ -407,10 +407,10 @@ class TestYahooProvider:
         assert len(fake_download["calls"]) == n
         assert not s.empty and set(s) == {70.0}
 
-    def test_offline_without_cache_is_empty(self, tmp_path, fake_download):
+    def test_offline_without_cache_raises_friendly_error(self, tmp_path, fake_download):
         yp = YahooProvider(cache_dir=tmp_path, offline=True)
-        s = yp.close("NOPE", pd.Timestamp("2025-02-03"), pd.Timestamp("2025-02-07"))
-        assert s.empty
+        with pytest.raises(DataError, match="no saved data for NOPE yet"):
+            yp.close("NOPE", pd.Timestamp("2025-02-03"), pd.Timestamp("2025-02-07"))
         assert fake_download["calls"] == []
 
     def test_empty_frame_handled(self, tmp_path, fake_download):
@@ -430,7 +430,7 @@ class TestYahooProvider:
 
     def test_persistent_failure_raises_data_error(self, tmp_path, fake_download):
         fake_download["raise_times"] = 100
-        with pytest.raises(DataError, match="download failed"):
+        with pytest.raises(DataError, match="could not reach Yahoo Finance for VWCE.DE"):
             YahooProvider(cache_dir=tmp_path).close("VWCE.DE", pd.Timestamp("2025-02-01"), pd.Timestamp("2025-10-31"))
 
     def test_currency_from_fast_info_and_cached(self, tmp_path, monkeypatch):

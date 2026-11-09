@@ -181,6 +181,8 @@ class Portfolio:
         self.benchmarks = [b.upper() for b in (benchmarks or [])]
         self.split_adjust = split_adjust
         self.warnings: list[str] = []
+        if self.as_of > pd.Timestamp.today().normalize():
+            self.warnings.append(f"valuation date {self.as_of.date()} is in the future: prices after today are not known")
         future = [t for t in self.txs if t.date > self.as_of]
         if future:
             self.warnings.append(f"{len(future)} transaction(s) after {self.as_of.date()} ignored")
@@ -229,7 +231,11 @@ class Portfolio:
             txs = [t for t in self.txs if t.ticker == tk]
             mccy, scale, have_ccy = self._market_ccy(tk, txs)
             splits = self.provider.splits(tk) if self.split_adjust else pd.Series(dtype=float)
-            market = self.provider.close(tk, self.fetch_start, self.as_of) * scale
+            try:
+                market = self.provider.close(tk, self.fetch_start, self.as_of) * scale
+            except DataError as e:
+                self.warnings.append(f"{tk}: {e}")
+                market = pd.Series(dtype=float)
             if market.empty:
                 self.warnings.append(f"{tk}: no market prices, valued at last transaction price")
             mfx = self._fx_daily(mccy)
