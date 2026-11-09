@@ -257,3 +257,22 @@ class TestRound2Core:
         r = Portfolio(txs, p, as_of="2025-06-01", benchmarks=["ZZZZ"]).report()
         assert any("benchmark ZZZZ skipped" in w for w in r.warnings)
         assert "benchmark ZZZZ skipped" in render_text(r)
+
+
+def test_semicolon_file_reads_three_decimal_comma_values(tmp_path):
+    """Czech Excel writes 12,125 (= 12.125) in ';' files; that must load, not be called ambiguous."""
+    from portfolio_tracker.transactions import load_transactions
+    p = tmp_path / "cz.csv"
+    p.write_bytes("﻿date;type;ticker;quantity;price;fee;currency;amount;fx_rate\r\n"
+                  "02.01.2024;buy;VWCE.DE;3,125;12,125;1;;;\r\n".encode("utf-8"))
+    (t,) = load_transactions(p)
+    assert t.quantity == 3.125 and t.price == 12.125
+
+
+def test_comma_file_still_rejects_ambiguous_value(tmp_path):
+    import pytest
+    from portfolio_tracker.transactions import LedgerError, load_transactions
+    p = tmp_path / "en.csv"
+    p.write_text('date,type,ticker,quantity,price,fee,currency,amount,fx_rate\n2024-01-02,buy,VWCE.DE,"1,234",100,,,,\n')
+    with pytest.raises(LedgerError, match="ambiguous"):
+        load_transactions(p)

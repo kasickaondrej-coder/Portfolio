@@ -217,6 +217,14 @@ class TestAppendTransaction:
         txs = load_transactions(p)
         assert [t.price for t in txs] == [100.0, 101.0]
 
+    def test_append_three_decimals_to_decimal_comma_file(self, tmp_path):
+        # 12.125 written as "12,125" would read back as ambiguous and the append (or a whole savings plan) failed
+        p = write(tmp_path / "t.csv", "date;type;ticker;quantity;price;fee;currency;amount;fx_rate\n"
+                                       "2024-01-02;buy;VWCE.DE;1;100,5;;;;\n")
+        append_transaction(p, date="2024-02-01", type="buy", ticker="VWCE.DE", quantity=3.125, price="12.125")
+        assert p.read_text().splitlines()[-1] == "2024-02-01;buy;VWCE.DE;3,1250;12,1250;;;;"
+        assert [(t.quantity, t.price) for t in load_transactions(p)] == [(1.0, 100.5), (3.125, 12.125)]
+
 
 # ============================================================ StaticProvider
 def _prices_csv(tmp_path: Path, text: str) -> Path:

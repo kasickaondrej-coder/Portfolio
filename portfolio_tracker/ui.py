@@ -770,14 +770,20 @@ def require_file(path: str) -> None:
 
 
 def held_on(path: str, ticker: str, date: pd.Timestamp) -> float:
-    """Quantity of ticker held at the end of `date` according to the file (quantities as entered)."""
+    """Quantity of ticker that can still be sold on `date` according to the file (quantities as entered): the
+    holding at the end of that day, or less if later sells in the file already need part of it."""
     if os.path.getsize(path) == 0:
         return 0.0
-    q = 0.0
+    moves: dict = {}
     for t in load_transactions(path, allow_empty=True):
-        if t.ticker == ticker and t.date <= date:
-            q += t.quantity if t.type == "buy" else -t.quantity if t.type == "sell" else 0.0
-    return q
+        if t.ticker == ticker and t.type in ("buy", "sell"):
+            moves[t.date] = moves.get(t.date, 0.0) + (t.quantity if t.type == "buy" else -t.quantity)
+    q = sum(v for d, v in moves.items() if d <= date)
+    low = q
+    for d in sorted(d for d in moves if d > date):
+        q += moves[d]
+        low = min(low, q)
+    return low
 
 
 def do_add(f: dict) -> str:

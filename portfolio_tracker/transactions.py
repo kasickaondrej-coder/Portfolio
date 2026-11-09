@@ -66,8 +66,13 @@ def _at(line: int) -> str:
     return f"line {line}: " if line else ""
 
 
-def _num(raw: Optional[str], name: str, line: int, default: Optional[float] = 0.0) -> Optional[float]:
-    """Parse 1234.5, 1234,5, 1,234.50, 1.234,50, 1 234,5. Rejects ambiguous 1,234 and nan/inf."""
+def _num(raw: Optional[str], name: str, line: int, default: Optional[float] = 0.0,
+         decimal_comma: bool = False) -> Optional[float]:
+    """Parse 1234.5, 1234,5, 1,234.50, 1.234,50, 1 234,5. Rejects ambiguous 1,234 and nan/inf.
+
+    decimal_comma: the value comes from a file whose separator is not a comma (e.g. Czech
+    Excel ';' files). There a single comma can only be the decimal mark, so 12,125 = 12.125.
+    """
     if raw is None or str(raw).strip() == "":
         return default
     txt = str(raw).strip().replace("\u00a0", "").replace(" ", "").replace("'", "")
@@ -90,7 +95,7 @@ def _num(raw: Optional[str], name: str, line: int, default: Optional[float] = 0.
             raise bad
         txt = txt.replace(".", "")
     elif "," in txt:
-        if _AMBIGUOUS.match(txt):
+        if _AMBIGUOUS.match(txt) and not decimal_comma:
             raise LedgerError(
                 f"{_at(line)}{name}={raw!r} is ambiguous (thousands or decimal separator?); "
                 "write 1234 or 1.234 / 1234,0"
@@ -144,7 +149,8 @@ def clean_ticker(raw: Optional[str], line: int = 0) -> str:
     return t
 
 
-def parse_rows(rows: list[dict], start_line: int = 2, lines: Optional[list[int]] = None) -> list[Transaction]:
+def parse_rows(rows: list[dict], start_line: int = 2, lines: Optional[list[int]] = None,
+               decimal_comma: bool = False) -> list[Transaction]:
     txs: list[Transaction] = []
     for i, row in enumerate(rows):
         line = lines[i] if lines else start_line + i
@@ -167,12 +173,12 @@ def parse_rows(rows: list[dict], start_line: int = 2, lines: Optional[list[int]]
             date=d,
             type=t,
             ticker=ticker,
-            quantity=_num(row.get("quantity"), "quantity", line),
-            price=_num(row.get("price"), "price", line),
-            fee=_num(row.get("fee"), "fee", line),
+            quantity=_num(row.get("quantity"), "quantity", line, decimal_comma=decimal_comma),
+            price=_num(row.get("price"), "price", line, decimal_comma=decimal_comma),
+            fee=_num(row.get("fee"), "fee", line, decimal_comma=decimal_comma),
             currency=ccy,
-            amount=_num(row.get("amount"), "amount", line),
-            fx_rate=_num(row.get("fx_rate"), "fx_rate", line, default=None),
+            amount=_num(row.get("amount"), "amount", line, decimal_comma=decimal_comma),
+            fx_rate=_num(row.get("fx_rate"), "fx_rate", line, default=None, decimal_comma=decimal_comma),
             line=line,
         )
         if scale != 1.0:  # prices entered in pence: convert to pounds
@@ -213,7 +219,7 @@ def parse_text(text: str, allow_empty: bool = False) -> list[Transaction]:
     for row in reader:
         rows.append(row)
         lines.append(reader.line_num)
-    txs = parse_rows(rows, lines=lines)
+    txs = parse_rows(rows, lines=lines, decimal_comma=dialect.delimiter != ",")
     if not txs and not allow_empty:
         raise LedgerError("no transactions in the file")
     return txs
@@ -247,7 +253,11 @@ def _fmt_value(v, name: str, decimal_comma: bool) -> str:
                 txt = format(Decimal(str(_num(txt, name, 0))), "f")
         else:
             txt = format(Decimal(str(float(v))), "f")
-        return txt.replace(".", ",") if decimal_comma else txt
+        if not decimal_comma:
+            return txt
+        txt = txt.replace(".", ",")
+        # 12,125 would read back as ambiguous (thousands or decimals?); 12,1250 is the same value and is not
+        return txt + "0" if _AMBIGUOUS.match(txt) else txt
     return str(v)
 
 

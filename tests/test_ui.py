@@ -442,6 +442,18 @@ def test_sell_above_holdings_needs_save_anyway(server, tmp_path):
     assert "added sell" in _add(server, type="sell", date="2025-02-01", quantity="8", price="11", force_hold="1")
 
 
+def test_earlier_sell_that_breaks_a_later_sell_is_refused(server, tmp_path):
+    # hold 10, sell 8 in June: a new sell of 5 in March leaves the June sell short (the report would then fail)
+    f = tmp_path / "my.csv"
+    use_file(server, f)
+    _add(server, date="2025-01-06", quantity="10")
+    assert "added sell" in _add(server, type="sell", date="2025-06-02", quantity="8", price="11")
+    before = f.read_bytes()
+    body = _add(server, type="sell", date="2025-03-03", quantity="5", price="11")
+    assert "you would sell 5 but only hold 2 on that date" in body and f.read_bytes() == before
+    assert "added sell" in _add(server, type="sell", date="2025-03-03", quantity="2", price="11")
+
+
 def test_comma_numbers_rejected_everywhere(server, tmp_path):
     f = tmp_path / "my.csv"
     use_file(server, f)
