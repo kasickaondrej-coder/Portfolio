@@ -1,5 +1,7 @@
 # Portfolio tracker (DCA aware, CLI)
 
+Step by step usage: see [GUIDE.md](GUIDE.md).
+
 A portfolio tracker for dated buy/sell/dividend transactions in ETFs and stocks. It values the portfolio every day from Yahoo Finance prices, so the returns account for when each contribution was made.
 
 ## Install
