@@ -25,7 +25,11 @@ def _year_fracs(flows: Sequence[tuple[date, float]]) -> tuple[list[float], list[
 
 def _npv(rate: float, ts: list[float], cfs: list[float]) -> float:
     base = 1.0 + rate
-    return sum(cf / base ** t for t, cf in zip(ts, cfs))
+    try:
+        return sum(cf / base ** t for t, cf in zip(ts, cfs))
+    except (OverflowError, ZeroDivisionError):
+        # base -> 0: the latest flows dominate
+        return math.copysign(math.inf, cfs[ts.index(max(ts))])
 
 
 def _net_same_day(flows: Iterable[tuple[date, float]]) -> list[tuple[date, float]]:
@@ -74,10 +78,7 @@ def xirr(flows: Iterable[tuple[date, float]], guess: float = 0.1) -> Optional[fl
 
     # Bisection fallback on (-1, hi]
     lo, hi = -0.999999999, 1.0
-    try:
-        f_lo = _npv(lo, ts, cfs)
-    except OverflowError:
-        f_lo = math.copysign(math.inf, cfs[-1])
+    f_lo = _npv(lo, ts, cfs)
     f_hi = _npv(hi, ts, cfs)
     while f_lo * f_hi > 0 and hi < 1e6:
         hi *= 10.0
@@ -115,6 +116,7 @@ def twr_daily_returns(
     inflows: pd.Series,
     outflows: pd.Series,
     min_base: float = 1e-9,
+    small_base_ratio: float = 0.05,
 ) -> pd.Series:
     """Daily sub-period returns with external flows.
 
@@ -122,18 +124,23 @@ def twr_daily_returns(
     inflows:  money put in on day t (buys incl. fees), >= 0
     outflows: money taken out on day t (net sale proceeds, cash dividends), >= 0
 
-    Inflows are treated as arriving at the start of the day (bought at the trade
-    price, then exposed to the move to the close) and outflows as leaving at the
-    end of the day (realised at the trade price). So
+    Flows are treated as happening at the end of the day (daily valuation, trades
+    roughly at the close):
+        r_t = (V_t + Out_t - In_t) / V_{t-1} - 1
+    so a buy at the closing price neither adds nor dilutes return. When there is
+    no prior value, or it is tiny compared with the inflow (leftover dust), the
+    inflow is treated as arriving at the start of the day instead:
         r_t = (V_t + Out_t) / (V_{t-1} + In_t) - 1
-    which stays well defined on full liquidation days.
+    which measures the move from the trade price to the close without blowing up.
     """
     v_prev = values.shift(1).fillna(0.0)
-    denom = v_prev + inflows
-    numer = values + outflows
-    r = numer / denom - 1.0
-    r[denom <= min_base] = 0.0
-    return r.fillna(0.0)
+    end_of_day = (values + outflows - inflows) / v_prev - 1.0
+    start_of_day = (values + outflows) / (v_prev + inflows) - 1.0
+    use_start = v_prev < small_base_ratio * inflows
+    r = end_of_day.where(~use_start, start_of_day)
+    r[(v_prev + inflows) <= min_base] = 0.0
+    r[(~use_start) & (v_prev <= min_base)] = 0.0
+    return r.replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
 
 
 def twr_index(daily_returns: pd.Series) -> pd.Series:

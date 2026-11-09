@@ -9,6 +9,7 @@ Every provider returns:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -147,13 +148,34 @@ class YahooProvider:
         p = self._path(symbol, kind)
         if not p.exists():
             return pd.Series(dtype=float)
-        df = pd.read_csv(p, index_col=0, parse_dates=True)
+        try:
+            df = pd.read_csv(p, index_col=0, parse_dates=True)
+        except Exception as e:  # corrupt cache: ignore it, it will be rebuilt
+            log.warning("ignoring unreadable cache file %s: %s", p, e)
+            return pd.Series(dtype=float)
         return _clean_index(df.iloc[:, 0]) if not df.empty else pd.Series(dtype=float)
+
+    # cache metadata: earliest date requested from Yahoo and the day of the last refresh
+    def _meta_path(self) -> Path:
+        return self.cache / "meta.json"
+
+    def _meta(self) -> dict:
+        try:
+            return json.loads(self._meta_path().read_text())
+        except Exception:
+            return {}
+
+    def _set_meta(self, key: str, start: pd.Timestamp) -> None:
+        m = self._meta()
+        old = m.get(key, {}).get("from")
+        frm = min(start, pd.Timestamp(old)) if old else start
+        m[key] = {"from": frm.strftime("%Y-%m-%d"), "fetched": pd.Timestamp.today().strftime("%Y-%m-%d")}
+        self._meta_path().write_text(json.dumps(m, indent=1, sort_keys=True))
 
     def _download(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp, adjusted: bool) -> pd.Series:
         yf = self._yf()
         last_err = None
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 raw = yf.download(
                     symbol, start=start.strftime("%Y-%m-%d"), end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
@@ -168,38 +190,64 @@ class YahooProvider:
                 return _clean_index(s)
             except Exception as e:  # rate limits, network errors
                 last_err = e
-                time.sleep(2 ** (attempt + 1))
+                time.sleep(2 ** attempt)
         raise DataError(f"download failed for {symbol}: {last_err}")
 
     def close(self, symbol, start, end, adjusted=False):
+        """Daily closes. Refreshed at most once per day. Because Yahoo rescales history
+        after splits (Close) and dividends (Adj Close), an incremental refresh compares
+        the overlapping rows with the cache and refetches the full range on mismatch."""
         start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
         key = (symbol, adjusted)
         kind = "adj" if adjusted else "close"
-        cached = self._mem.get(key)
-        if cached is None:
-            cached = self._read(symbol, kind)
+        mkey = f"{symbol}|{kind}"
+        if key in self._mem:
+            cached, covered_from = self._mem[key]
+            if covered_from <= start:
+                return cached.loc[start:end]
+        cached = self._read(symbol, kind)
+        meta = self._meta().get(mkey, {})
         today = pd.Timestamp.today().normalize()
-        want_end = min(end, today)
-        stale = (
-            cached.empty
-            or cached.index.min() > start + pd.Timedelta(days=7)
-            or cached.index.max() < want_end - pd.Timedelta(days=self.refresh_days)
+        covered_from = pd.Timestamp(meta["from"]) if meta.get("from") and not cached.empty else None
+        fresh = (
+            not cached.empty
+            and covered_from is not None
+            and covered_from <= start
+            and meta.get("fetched") == today.strftime("%Y-%m-%d")
         )
-        if stale and not self.offline:
-            if cached.empty or cached.index.min() > start + pd.Timedelta(days=7):
-                fetch_start = start  # cache does not reach back far enough: refetch everything
+        if not fresh and self.offline:
+            if cached.empty:
+                log.warning("offline and no cached prices for %s", symbol)
             else:
-                fetch_start = cached.index.max() - pd.Timedelta(days=self.refresh_days)
-            new = self._download(symbol, fetch_start, want_end, adjusted)
-            if not new.empty:
-                merged = pd.concat([cached, new])
-                cached = merged[~merged.index.duplicated(keep="last")].sort_index()
+                log.warning("offline: using cached prices for %s (last %s)", symbol, cached.index.max().date())
+        elif not fresh:
+            want_end = max(min(end, today), start)
+            if cached.empty or covered_from is None or covered_from > start:
+                new = self._download(symbol, start, want_end, adjusted)
+                full = True
+            else:
+                inc_start = cached.index.max() - pd.Timedelta(days=self.refresh_days)
+                new = self._download(symbol, inc_start, want_end, adjusted)
+                full = False
+                overlap = cached.index.intersection(new.index)
+                if len(overlap) and ((new.loc[overlap] / cached.loc[overlap] - 1).abs() > 0.005).any():
+                    log.info("%s: history rescaled by Yahoo (split/dividend), refetching", symbol)
+                    new = self._download(symbol, covered_from, want_end, adjusted)
+                    full = True
+            if new.empty:
+                if cached.empty:
+                    log.warning("no price data for %s", symbol)
+                else:
+                    log.warning("refresh failed for %s, using cached prices up to %s", symbol, cached.index.max().date())
+            else:
+                if full:
+                    cached = new
+                else:
+                    merged = pd.concat([cached, new])
+                    cached = merged[~merged.index.duplicated(keep="last")].sort_index()
                 cached.rename("close").to_frame().to_csv(self._path(symbol, kind))
-            elif cached.empty:
-                log.warning("no price data for %s", symbol)
-        elif stale:
-            log.warning("offline: using cached data for %s (may be stale)", symbol)
-        self._mem[key] = cached
+                self._set_meta(mkey, start if covered_from is None else min(start, covered_from))
+        self._mem[key] = (cached, start if covered_from is None else min(start, covered_from))
         return cached.loc[start:end]
 
     def currency(self, symbol):
@@ -208,7 +256,10 @@ class YahooProvider:
         p = self.cache / "currencies.csv"
         table = {}
         if p.exists():
-            table = pd.read_csv(p, index_col=0).iloc[:, 0].astype(str).to_dict()
+            try:
+                table = pd.read_csv(p, index_col=0, keep_default_na=False, dtype=str).iloc[:, 0].to_dict()
+            except Exception:
+                table = {}
         code = table.get(symbol)
         if not code and not self.offline:
             try:
@@ -236,10 +287,10 @@ class YahooProvider:
             try:
                 s = self._yf().Ticker(symbol).splits
                 s = _clean_index(s) if s is not None and len(s) else pd.Series(dtype=float)
+                s.rename("split").to_frame().to_csv(p)  # cache only successful lookups
             except Exception as e:
                 log.warning("could not fetch splits for %s: %s", symbol, e)
-                s = pd.Series(dtype=float)
-            s.rename("split").to_frame().to_csv(p)
+                s = self._read(symbol, "splits")  # fall back to an older cache if any
         s = s[s > 0]
         self._splits[symbol] = s
         return s
@@ -250,9 +301,11 @@ def fx_series(provider: Provider, ccy: str, base: str, start: pd.Timestamp, end:
     if ccy == base:
         return pd.Series(1.0, index=pd.date_range(start, end, freq="D"))
     direct = provider.close(f"{ccy}{base}=X", start, end)
+    direct = direct[direct > 0]
     if not direct.empty:
         return direct
     inverse = provider.close(f"{base}{ccy}=X", start, end)
+    inverse = inverse[inverse > 0]
     if not inverse.empty:
         return 1.0 / inverse
     if ccy != "USD" and base != "USD":  # cross via USD

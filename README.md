@@ -30,7 +30,13 @@ date,type,ticker,quantity,price,fee,currency,amount,fx_rate
 | amount   | dividends: the total net cash received |
 | fx_rate  | optional: base currency per 1 unit of `currency` that your broker actually charged |
 
-Commas, semicolons or tabs are accepted as separators. Rows can be in any order.
+- Separators: commas, semicolons or tabs.
+- Rows can be in any order.
+- Dates: `YYYY-MM-DD` or `DD.MM.YYYY`.
+- Decimal comma: accepted (`118,40`), and so are `1.234,50` and `1,234.50`.
+- Ambiguous values such as `1,234` are rejected, not guessed.
+- Pence: put `GBX` (or `GBp`) in the currency column and the values are converted to GBP.
+- Price check: a trade price more than 20x off the market price that day produces a warning, which usually means pence and pounds were mixed up.
 
 To append a row from the command line:
 
@@ -63,7 +69,7 @@ All figures are in the base currency.
 - **Total P/L** = market value + sale proceeds + dividends - everything bought (fees included), split into realized, unrealized and dividends. Cost basis is the average cost in the base currency, at the FX rate on each trade date.
 - **Total return** = total P/L / total bought.
 - **XIRR (money-weighted, annualised)**: the rate your own cash flows actually earned, including the timing of your DCA buys. This is the number to look at for "how well is my money doing".
-- **TWR (time-weighted)**: the investments' own performance, independent of when money was added. Compare it with an index or fund. Daily chain-linked: `r_t = (V_t + out_t) / (V_{t-1} + in_t) - 1`.
+- **TWR (time-weighted)**: the investments' own performance, independent of when money was added. Compare it with an index or fund. Daily chain-linked with flows at the end of the day: `r_t = (V_t + out_t - in_t) / V_{t-1} - 1`. On the first day, or when the prior value is tiny compared with the buy, it uses `(V_t + out_t) / (V_{t-1} + in_t) - 1`.
 - If XIRR is below TWR, your contributions were timed unfavourably, for example large buys just before a drop.
 - **Period returns** for 1W, 1M, 3M, 6M, YTD, 1Y, 3Y and 5Y. Each period shows:
   - absolute P/L = end value - start value - net money added, so contributions are not counted as gains
@@ -83,9 +89,11 @@ All figures are in the base currency.
 
 - Valuation uses Yahoo's `Close`, which is adjusted for splits but not for dividends. Dividends are counted only when you enter them as `dividend` rows. Accumulating ETFs need nothing extra.
 - Splits are fetched from Yahoo, and quantities entered before a split are scaled automatically. Use `--no-split-adjust` if you already entered post-split quantities.
+- Quantities are always shown in today's post-split units. Yahoo adjusts its whole price history for every split up to today, so this also applies with `--as-of`.
 - Weekends and holidays use the last close (forward-filled).
 - Trades are booked at your trade price. A day's TWR measures the move from the trade price to the close.
 - For a history under 1 year, annualised figures are extrapolations and are flagged as such. The cumulative figures are the reliable ones.
+- Yahoo data is cached and refreshed at most once a day. If Yahoo rescales history after a split, or after a dividend for the adjusted series, the whole range is downloaded again.
 - If Yahoo is unreachable, prices come from the cache in `~/.cache/portfolio_tracker` (or `$PORTFOLIO_CACHE`). Without a cache, holdings are valued at the last transaction price, with a warning.
 
 ## Offline price file format

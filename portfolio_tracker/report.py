@@ -75,10 +75,12 @@ def render_text(r: Report, top_n: int = 5) -> str:
         L.append("BENCHMARK (same cash flows on the same dates invested in the benchmark, total return)")
         rows = []
         for bm in r.benchmarks:
-            rows.append([bm.symbol, money(bm.end_value, b), money(bm.total_pl, b), pct(bm.xirr),
-                         pct(r.xirr - bm.xirr) if r.xirr is not None and bm.xirr is not None else "n/a",
-                         money(r.value - bm.end_value, b) if not bm.clamped else "n/a (clamped)"])
-        L.append(_table(["Benchmark", "Value", "P/L", "XIRR", "Your XIRR - bm", "Your value - bm"], rows))
+            diff_x = pct(r.xirr - bm.xirr) if r.xirr is not None and bm.xirr is not None else "n/a"
+            diff_v = money(r.total_pl - bm.total_pl, b)
+            if bm.clamped:
+                diff_x, diff_v = diff_x + " (approx)", diff_v + " (approx)"
+            rows.append([bm.symbol, money(bm.end_value, b), money(bm.total_pl, b), pct(bm.xirr), diff_x, diff_v])
+        L.append(_table(["Benchmark", "Value", "P/L", "XIRR", "Your XIRR - bm", "Your P/L - bm"], rows))
 
     L.append("")
     L.append("PERIOD RETURNS")
@@ -100,9 +102,12 @@ def render_text(r: Report, top_n: int = 5) -> str:
         rows.append([h.ticker + (" (stale)" if h.stale else ""), h.currency, f"{h.quantity:,.4f}".rstrip("0").rstrip("."),
                      money(h.price_base), money(h.value), f"{h.weight * 100:.1f}%", money(h.avg_cost),
                      money(h.cost_basis), money(h.unrealized), money(h.realized), money(h.dividends),
-                     money(h.total_pl), pct(h.total_pl / h.invested if h.invested else None), pct(h.xirr)])
+                     money(h.total_pl), pct(h.total_pl / h.invested if h.invested else None),
+                     pct(h.xirr) + ("*" if h.short_history else "")])
     L.append(_table(["Ticker", "Ccy", "Qty", f"Price {b}", "Value", "Weight", "Avg cost", "Cost basis",
                      "Unrealized", "Realized", "Dividends", "Total P/L", "P/L %", "XIRR"], rows))
+    if any(h.short_history for h in r.holdings):
+        L.append("  * held under 1 year: annualised XIRR is an extrapolation, look at P/L % instead.")
 
     def movers(title, contribs):
         L.append("")

@@ -211,8 +211,8 @@ def test_twr_flat_prices_with_outflows_zero_return():
 
 
 def test_twr_known_return():
-    # day1 buy 100; day2 value 110 (+10%); day3 add 100 at start, close 231 -> 231/210-1 = 10%
-    values = _s([100, 110, 231])
+    # day1 buy 100; day2 value 110 (+10%); day3 old 110 gains 10% -> 121, plus 100 bought at the close = 221
+    values = _s([100, 110, 221])
     inflows = _s([100, 0, 100])
     r = twr_daily_returns(values, inflows, _s([0, 0, 0]))
     assert list(r) == pytest.approx([0.0, 0.10, 0.10])

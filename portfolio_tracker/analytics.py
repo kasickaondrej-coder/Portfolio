@@ -51,6 +51,7 @@ class Holding:
     invested: float           # all buys incl. fees
     xirr: Optional[float]
     first_buy: pd.Timestamp
+    short_history: bool
     last_price_date: Optional[pd.Timestamp]
     stale: bool
 
@@ -123,6 +124,17 @@ class Report:
 
 
 # ---------------------------------------------------------------- helpers
+def _xirr(flows: list[tuple[pd.Timestamp, float]]) -> Optional[float]:
+    """xirr, but -100% when everything was lost (only outflows from the investor, end value 0)."""
+    r = xirr(flows)
+    if r is None:
+        nz = [a for _, a in flows if abs(a) > 1e-9]
+        span = (max(d for d, _ in flows) - min(d for d, _ in flows)).days if flows else 0
+        if nz and all(a < 0 for a in nz) and span > 0:
+            return -1.0
+    return r
+
+
 def _rate_on(series: pd.Series, day: pd.Timestamp) -> Optional[float]:
     """Last value on or before `day`; first value after it if none before."""
     s = series.dropna()
@@ -134,11 +146,15 @@ def _rate_on(series: pd.Series, day: pd.Timestamp) -> Optional[float]:
     return float(s.iloc[0])
 
 
-def _split_factor(splits: pd.Series, trade_date: pd.Timestamp, as_of: pd.Timestamp) -> float:
-    """Product of split ratios effective after the trade date (ex date > trade date)."""
+def _split_factor(splits: pd.Series, trade_date: pd.Timestamp) -> float:
+    """Product of split ratios with ex date after the trade date.
+
+    All later splits count, including ones after --as-of, because Yahoo's Close
+    history is adjusted for every split up to today.
+    """
     if splits is None or splits.empty:
         return 1.0
-    s = splits[(splits.index > trade_date) & (splits.index <= as_of)]
+    s = splits[splits.index > trade_date]
     f = 1.0
     for r in s:
         if r and r > 0:
@@ -221,7 +237,7 @@ class Portfolio:
             # transaction amounts in base currency
             fallback = pd.Series(index=cal, dtype=float)
             for t in txs:
-                f = _split_factor(splits, t.date, self.as_of)
+                f = _split_factor(splits, t.date)
                 t.adj_quantity = t.quantity * f
                 t.adj_price = t.price / f if f else t.price
                 tccy = t.currency or mccy
@@ -278,6 +294,18 @@ class Portfolio:
                     f"{tk}: {int(used_fallback.sum())} day(s) without market price, used transaction price"
                 )
             price_df[tk] = price.fillna(0.0)
+
+            if not market.empty:
+                for t in txs:
+                    if t.type == "dividend" or t.adj_price <= 0:
+                        continue
+                    mp = _rate_on(priced, t.date)
+                    tp = t.adj_price * t._rate
+                    if mp and mp > 0 and not (1 / 20 < tp / mp < 20):
+                        self.warnings.append(
+                            f"line {t.line}: {tk} price {t.price:g} {t.currency or mccy} is {tp / mp:.1f}x the market "
+                            f"price that day; check units (pence vs pounds) and the currency column"
+                        )
 
             last_px_date = market.index.max() if not market.empty else None
             stale = q.iloc[-1] > 0 and (last_px_date is None or (self.as_of - last_px_date).days > STALE_DAYS)
@@ -352,7 +380,7 @@ class Portfolio:
             if v0 == 0 and v1 == 0 and fin == 0 and fout == 0:
                 continue
             pl = v1 - v0 - fin + fout
-            own = twr_between(self.ticker_index[tk], start, end)
+            own = twr_between(self.ticker_index[tk], start, end) if (v0 > 0 or fin > 0) else None
             pct = pl / dietz_denominator if dietz_denominator and dietz_denominator > 1e-9 else None
             res.append(Contribution(tk, pl, pct, own, v0, v1))
         res.sort(key=lambda c: c.abs_pl, reverse=True)
@@ -398,22 +426,30 @@ class Portfolio:
             p = p.bfill()
         units = 0.0
         clamped = False
-        vals = []
+        executed_out = pd.Series(0.0, index=self.cal)
         for d in self.cal:
-            pr = p.loc[d]
-            units += (self.In.loc[d] - self.Out.loc[d]) / pr
-            if units < -1e-12:
-                units, clamped = 0.0, True
-            vals.append(units * pr)
-        bv = pd.Series(vals, index=self.cal)
-        end_v = float(bv.iloc[-1])
-        flows = self._flows(None, None, self.as_of, 0.0, end_v)
-        total_pl = end_v + float(self.Out.sum()) - float(self.In.sum())
+            pr = float(p.loc[d])
+            units += self.In.loc[d] / pr
+            want = self.Out.loc[d] / pr
+            sold = min(units, want)
+            if want - sold > 1e-9:
+                clamped = True  # benchmark position too small to fund this withdrawal
+            units -= sold
+            executed_out.loc[d] = sold * pr
+        end_v = float(units * p.iloc[-1])
+        net = executed_out - self.In
+        flows = [(d, float(a)) for d, a in net.items() if abs(a) > 1e-12] + [(self.as_of, end_v)]
+        total_pl = end_v + float(executed_out.sum()) - float(self.In.sum())
+        if clamped:
+            self.warnings.append(
+                f"benchmark {symbol}: some of your withdrawals exceeded the benchmark position and were capped; "
+                "comparison is approximate"
+            )
         idx = p / p.loc[self.inception]
         twr_tot = float(idx.iloc[-1] - 1.0)
         self._bm_index = getattr(self, "_bm_index", {})
         self._bm_index[symbol] = p
-        return BenchmarkResult(symbol, end_v, total_pl, xirr(flows), twr_tot,
+        return BenchmarkResult(symbol, end_v, total_pl, _xirr(flows), twr_tot,
                                annualise(twr_tot, (self.as_of - self.inception).days), clamped)
 
     # -------------------------------------------------------- report
@@ -434,8 +470,9 @@ class Portfolio:
                 avg_cost=c["cost"] / c["qty"] if c["qty"] > QTY_EPS else 0.0, cost_basis=c["cost"],
                 unrealized=unreal, realized=c["realized"], dividends=c["dividends"], fees=c["fees"],
                 total_pl=unreal + c["realized"] + c["dividends"], invested=c["invested"],
-                xirr=xirr(flows) if (self.as_of - self.inception).days > 0 else None,
-                first_buy=min(t.date for t in self.txs if t.ticker == tk),
+                xirr=_xirr(flows),
+                first_buy=(fb := min(t.date for t in self.txs if t.ticker == tk)),
+                short_history=(self.as_of - fb).days < SHORT_HISTORY_DAYS,
                 last_price_date=m["last_price_date"], stale=m["stale"],
             ))
         holdings.sort(key=lambda h: h.value, reverse=True)
@@ -446,7 +483,7 @@ class Portfolio:
         total_pl = total_v + sold_div - bought
         days = (self.as_of - self.inception).days
         flows = self._flows(None, None, self.as_of, 0.0, total_v)
-        x = xirr(flows)
+        x = _xirr(flows)
         twr_tot = float(self.index.iloc[-1] - 1.0)
 
         alltime_start = self.cal[0]
