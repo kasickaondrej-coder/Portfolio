@@ -507,3 +507,24 @@ def test_no_market_data_foreign_currency_uses_fx():
     r = build([tx("2024-01-02", "buy", "ZZZ", 10, 100, currency="USD")], {"USDEUR=X": flat(0.9)}, ccy={},
               as_of="2024-06-01").report()
     assert r.value == pytest.approx(900)
+
+
+def test_small_position_topup_does_not_amplify_trade_gap():
+    # flat prices; 10 held, 9 sold, then 10 bought 2% below the close.
+    # The 20 EUR trade gain must not turn into a +20% TWR on the 100 EUR leftover.
+    rows = [tx("2024-01-02", "buy", "AAA", 10, 100), tx("2024-03-01", "sell", "AAA", 9, 100),
+            tx("2024-06-03", "buy", "AAA", 10, 98)]
+    pf = build(rows, {"AAA": flat(100)}, as_of="2024-12-31")
+    own = pf.ticker_index["AAA"].iloc[-1] - 1
+    assert own == pytest.approx(20 / 1080)
+    assert pf.report().twr_total == pytest.approx(20 / 1080)
+
+
+def test_inverted_fx_rate_warns():
+    rows = [tx("2024-01-02", "buy", "US", 1, 100, currency="USD", fx_rate="1.10")]
+    prices = {"US": flat(100), "USDEUR=X": flat(0.91)}
+    rep = build(rows, prices, ccy={"US": "USD"}, as_of="2024-02-01").report()
+    assert any("fx_rate" in w and "inverted" in w for w in rep.warnings)
+    rows = [tx("2024-01-02", "buy", "US", 1, 100, currency="USD", fx_rate="0.92")]
+    rep = build(rows, prices, ccy={"US": "USD"}, as_of="2024-02-01").report()
+    assert not any("fx_rate" in w for w in rep.warnings)

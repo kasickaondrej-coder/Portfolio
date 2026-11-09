@@ -243,6 +243,16 @@ class Portfolio:
                 tccy = t.currency or mccy
                 if t.fx_rate is not None:
                     rate = t.fx_rate
+                    try:
+                        mkt = 1.0 if tccy == self.base else _rate_on(self._fx(tccy), t.date)
+                    except DataError:
+                        mkt = None
+                    if mkt and not (0.9 < rate / mkt < 1.1):
+                        self.warnings.append(
+                            f"line {t.line}: fx_rate {rate:g} differs from the market rate {mkt:.4g} "
+                            f"{self.base} per 1 {tccy}; fx_rate must be {self.base} per 1 {tccy}"
+                            + (" (it looks inverted)" if 0.9 < rate * mkt < 1.1 else "")
+                        )
                 elif tccy == self.base:
                     rate = 1.0
                 else:
@@ -337,7 +347,8 @@ class Portfolio:
         for tk in self.tickers:
             qty = cost = realized = dividends = fees = invested = 0.0
             for t in (x for x in self.txs if x.ticker == tk):
-                fees += t.fee * t._rate
+                if t.type != "dividend":  # dividend amounts are entered net
+                    fees += t.fee * t._rate
                 if t.type == "buy":
                     qty += t.adj_quantity
                     cost += t._base_amount
@@ -410,6 +421,9 @@ class Portfolio:
             p = self.period(label, start)
             if p is not None:
                 out.append(p)
+        since = self.period("ALL", self.cal[0])  # since inception, always available
+        if since is not None:
+            out.append(since)
         return out
 
     # -------------------------------------------------------- benchmark

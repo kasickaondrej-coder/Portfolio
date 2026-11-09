@@ -69,9 +69,9 @@ All figures are in the base currency.
 - **Total P/L** = market value + sale proceeds + dividends - everything bought (fees included), split into realized, unrealized and dividends. Cost basis is the average cost in the base currency, at the FX rate on each trade date.
 - **Total return** = total P/L / total bought.
 - **XIRR (money-weighted, annualised)**: the rate your own cash flows actually earned, including the timing of your DCA buys. This is the number to look at for "how well is my money doing".
-- **TWR (time-weighted)**: the investments' own performance, independent of when money was added. Compare it with an index or fund. Daily chain-linked with flows at the end of the day: `r_t = (V_t + out_t - in_t) / V_{t-1} - 1`. On the first day, or when the prior value is tiny compared with the buy, it uses `(V_t + out_t) / (V_{t-1} + in_t) - 1`.
+- **TWR (time-weighted)**: the investments' own performance, independent of when money was added. Compare it with an index or fund. Daily chain-linked with flows at the end of the day: `r_t = (V_t + out_t - in_t) / V_{t-1} - 1`. On the first day, or when the day's buy is larger than the prior value, it uses `(V_t + out_t) / (V_{t-1} + in_t) - 1`.
 - If XIRR is below TWR, your contributions were timed unfavourably, for example large buys just before a drop.
-- **Period returns** for 1W, 1M, 3M, 6M, YTD, 1Y, 3Y and 5Y. Each period shows:
+- **Period returns** for 1W, 1M, 3M, 6M, YTD, 1Y, 3Y, 5Y and ALL (since inception). A period that starts before your first transaction is left out. Each period shows:
   - absolute P/L = end value - start value - net money added, so contributions are not counted as gains
   - TWR
   - Modified Dietz money-weighted return

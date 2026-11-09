@@ -116,7 +116,7 @@ def twr_daily_returns(
     inflows: pd.Series,
     outflows: pd.Series,
     min_base: float = 1e-9,
-    small_base_ratio: float = 0.05,
+    small_base_ratio: float = 1.0,
 ) -> pd.Series:
     """Daily sub-period returns with external flows.
 
@@ -128,10 +128,12 @@ def twr_daily_returns(
     roughly at the close):
         r_t = (V_t + Out_t - In_t) / V_{t-1} - 1
     so a buy at the closing price neither adds nor dilutes return. When there is
-    no prior value, or it is tiny compared with the inflow (leftover dust), the
-    inflow is treated as arriving at the start of the day instead:
+    no prior value, or the inflow is larger than it (small_base_ratio * V_{t-1}),
+    the inflow is treated as arriving at the start of the day instead:
         r_t = (V_t + Out_t) / (V_{t-1} + In_t) - 1
-    which measures the move from the trade price to the close without blowing up.
+    The end-of-day form books the gap between trade price and close (and fees)
+    on V_{t-1}, i.e. scaled by In_t / V_{t-1}; capping that ratio at 1 keeps a
+    1% trade/close gap from becoming a 20% daily return on a small position.
     """
     v_prev = values.shift(1).fillna(0.0)
     end_of_day = (values + outflows - inflows) / v_prev - 1.0
