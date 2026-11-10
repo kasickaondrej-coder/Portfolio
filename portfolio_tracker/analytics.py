@@ -55,6 +55,8 @@ class Holding:
     short_history: bool
     last_price_date: Optional[pd.Timestamp]
     stale: bool
+    price_effect: float = 0.0  # part of total_pl from the asset's own price (and dividends)
+    fx_effect: float = 0.0     # part of total_pl from exchange-rate moves between its currency and base
 
 
 @dataclass
@@ -123,6 +125,9 @@ class Report:
     warnings: list[str]
     daily: pd.DataFrame = field(repr=False, default=None)
     problems: list[str] = field(default_factory=list)
+    price_effect: float = 0.0
+    fx_effect: float = 0.0
+    payment_currencies: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- helpers
@@ -345,7 +350,7 @@ class Portfolio:
             if stale and last_px_date is not None:
                 self.warnings.append(f"{tk}: last market price is from {last_px_date.date()}")
             self.meta[tk] = dict(
-                currency=mccy, scale=scale, market=market, last_price_date=last_px_date, stale=stale,
+                currency=mccy, scale=scale, market=market, last_price_date=last_px_date, stale=stale, fx=mfx,
                 price_native_last=float(market.iloc[-1]) if not market.empty else None,
             )
 
@@ -500,6 +505,8 @@ class Portfolio:
             v = float(self.values[tk].iloc[-1])
             unreal = v - c["cost"]
             flows = self._flows(tk, None, self.as_of, 0.0, v)
+            total_tk = unreal + c["realized"] + c["dividends"]
+            price_fx = self._fx_split(tk, m["fx"], total_tk)
             holdings.append(Holding(
                 ticker=tk, currency=m["currency"], quantity=c["qty"],
                 price_native=m["price_native_last"], price_base=float(self.price[tk].iloc[-1]), value=v,
@@ -511,6 +518,7 @@ class Portfolio:
                 first_buy=(fb := min(t.date for t in self.txs if t.ticker == tk)),
                 short_history=(self.as_of - fb).days < SHORT_HISTORY_DAYS,
                 last_price_date=m["last_price_date"], stale=m["stale"],
+                price_effect=price_fx[0], fx_effect=price_fx[1],
             ))
         holdings.sort(key=lambda h: h.value, reverse=True)
 
@@ -553,4 +561,26 @@ class Portfolio:
             holdings=holdings, periods=periods, alltime_contributions=alltime, benchmarks=bms,
             contributions_count=sum(1 for t in self.txs if t.type == "buy"),
             warnings=list(dict.fromkeys(self.warnings)), daily=daily, problems=list(self.problems),
+            price_effect=sum(h.price_effect for h in holdings), fx_effect=sum(h.fx_effect for h in holdings),
+            payment_currencies=sorted({t.currency or self.meta[t.ticker]["currency"] for t in self.txs}),
         )
+
+    def _fx_split(self, tk: str, fx: pd.Series, total_pl: float) -> tuple[float, float]:
+        """Split a holding's P/L (base currency) into price effect and currency effect.
+
+        Every flow is expressed in the asset's trading currency at that day's market rate.
+        price effect = (value + money out - money in, all in the asset currency) x today's rate
+        currency effect = the rest = sum of flow x (today's rate - rate on the flow date)
+        If the asset trades in the base currency the currency effect is 0.
+        """
+        if self.meta[tk]["currency"] == self.base:
+            return total_pl, 0.0
+        fx = fx.where(fx > 0)
+        if fx.isna().all():
+            return total_pl, 0.0
+        fx = fx.ffill().bfill()
+        now = float(fx.iloc[-1])
+        local = float(self.values[tk].iloc[-1]) / now
+        local += float((self.outflow[tk] / fx).sum()) - float((self.inflow[tk] / fx).sum())
+        price = local * now
+        return price, total_pl - price

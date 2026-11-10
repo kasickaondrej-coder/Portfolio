@@ -342,3 +342,25 @@ def test_wrong_currency_column_is_reported_as_data_problem(tmp_path):
     assert len(r.problems) == 1 and "1 of 1 trade prices" in r.problems[0]
     text = render_text(r)
     assert text.startswith("!!! DATA PROBLEM")
+
+
+def test_fx_split_price_and_currency_effect(tmp_path):
+    """EUR asset bought with CZK, report in CZK: P/L splits into price effect + FX effect exactly."""
+    from portfolio_tracker.analytics import Portfolio
+    from portfolio_tracker.data import StaticProvider
+    from portfolio_tracker.transactions import parse_rows
+    p = tmp_path / "p.csv"
+    p.write_text("date,symbol,close,currency\n"
+                 "2025-01-06,AAA.DE,10,EUR\n2025-02-06,AAA.DE,12,EUR\n"
+                 "2025-01-06,EURCZK=X,25,CZK\n2025-02-06,EURCZK=X,24,CZK\n")
+    txs = parse_rows([dict(date="2025-01-06", type="buy", ticker="AAA.DE", quantity="4", price="250",
+                           currency="CZK")])  # 4 units at 10 EUR = 1000 CZK
+    prov = StaticProvider.from_csv(p)
+    r = Portfolio(txs, prov, base="CZK", as_of="2025-02-06").report()
+    # value 4*12*24 = 1152 CZK, P/L 152; price effect 4*(12-10)*24 = 192; FX effect 40 EUR*(24-25) = -40
+    assert r.total_pl == pytest.approx(152)
+    assert r.price_effect == pytest.approx(192)
+    assert r.fx_effect == pytest.approx(-40)
+    assert r.holdings[0].fx_effect == pytest.approx(-40)
+    e = Portfolio(txs, prov, base="EUR", as_of="2025-02-06").report()
+    assert e.fx_effect == pytest.approx(0) and e.payment_currencies == ["CZK"]

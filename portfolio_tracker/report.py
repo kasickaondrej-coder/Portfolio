@@ -52,6 +52,14 @@ def plain_words(r: Report) -> list[str]:
     month = next((p for p in r.periods if p.label == "1M"), None)
     if month is not None and month.abs_pl is not None and math.isfinite(month.abs_pl):
         out.append(f"Last month: {month.abs_pl:+,.2f} {b}.")
+    if abs(r.fx_effect) >= 0.005:
+        out.append(f"Of the total, {r.price_effect:+,.2f} {b} came from price changes and "
+                   f"{r.fx_effect:+,.2f} {b} from exchange rates.")
+    other = [c for c in r.payment_currencies if c != b]
+    if other and abs(r.fx_effect) < 0.005 and all(h.currency == b for h in r.holdings):
+        out.append(f"You paid in {', '.join(other)}, but these results are in {b} and your holdings trade in {b}, "
+                   f"so exchange rates play no part here. Set the base currency to {other[0]} to see your result "
+                   f"in {other[0]}, including the exchange-rate effect.")
     contribs = [c for c in r.alltime_contributions if c.abs_pl is not None]
     if contribs:
         best = max(contribs, key=lambda c: c.abs_pl)
@@ -88,6 +96,8 @@ def render_text(r: Report, top_n: int = 5) -> str:
         ["  realized", money(r.realized, b)],
         ["  unrealized", money(r.unrealized, b)],
         ["  dividends", money(r.dividends, b)],
+        ["Total P/L from price changes", money(r.price_effect, b)],
+        ["Total P/L from exchange rates (FX)", money(r.fx_effect, b)],
         ["Total return (P/L / total bought)", pct(r.simple_return)],
         ["Money-weighted return, annualised (XIRR)", pct(r.xirr) + ("  [short history, extrapolated]" if r.short_history else "")],
         ["Money-weighted return, cumulative", pct(r.xirr_period)],
@@ -136,10 +146,10 @@ def render_text(r: Report, top_n: int = 5) -> str:
         rows.append([h.ticker + (" (stale)" if h.stale else ""), h.currency, f"{h.quantity:,.4f}".rstrip("0").rstrip("."),
                      money(h.price_base), money(h.value), f"{h.weight * 100:.1f}%", money(h.avg_cost),
                      money(h.cost_basis), money(h.unrealized), money(h.realized), money(h.dividends),
-                     money(h.total_pl), pct(h.total_pl / h.invested if h.invested else None),
+                     money(h.total_pl), money(h.fx_effect), pct(h.total_pl / h.invested if h.invested else None),
                      pct(h.xirr) + ("*" if h.short_history else "")])
     L.append(_table(["Ticker", "Ccy", "Qty", f"Price {b}", "Value", "Weight", "Avg cost", "Cost basis",
-                     "Unrealized", "Realized", "Dividends", "Total P/L", "P/L %", "XIRR"], rows))
+                     "Unrealized", "Realized", "Dividends", "Total P/L", "of which FX", "P/L %", "XIRR"], rows))
     if any(h.short_history for h in r.holdings):
         L.append("  * held under 1 year: annualised XIRR is an extrapolation, look at P/L % instead.")
 

@@ -126,6 +126,16 @@ Each holding is shown separately, and all of them are combined into one portfoli
   If you enter it upside down (1.087 instead of 0.92), the report warns you.
 - **London pence:** London prices may be quoted in pence (GBp). Enter your price in pounds (`480.20`), or in pence with `GBX` in the currency column (`48020`, `GBX`).
 
+### Price effect and currency (FX) effect
+
+The report splits your total P/L into two lines: **from price changes** and **from exchange rates (FX)**. The holdings table also has an "of which FX" column.
+
+- The FX part only exists when a holding trades in a different currency from your **base currency**.
+- Example: you buy NQSE.DE (a EUR fund) with CZK.
+  - With base **EUR**, the FX part is 0, because measured in EUR only the fund's price matters. The report then reminds you that you paid in CZK.
+  - With base **CZK**, the report shows how much the EUR/CZK rate added or removed. If the euro weakened against the koruna since you bought, the FX part is negative.
+- To see your real result in the money you actually pay with, set the base currency on the Report page to that currency (CZK).
+
 ## 7. Dividends, sells, fees
 
 - **Dividend:** one row with `type` dividend, the ticker, the `amount` received (after tax), and the currency.
